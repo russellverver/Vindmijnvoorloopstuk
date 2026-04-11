@@ -87,7 +87,7 @@
     border: 1px solid #2a3b4f;
     border-radius: 8px;
     padding: 14px;
-    margin-bottom: 14px;
+    margin-bottom: 10px;
     display: flex;
     gap: 10px;
     align-items: center;
@@ -114,12 +114,16 @@
     cursor: pointer;
   }
   .controls button:hover { background: #7ad3f9; }
-  .controls button#locateBtn {
-    background: #66bb6a;
-    color: #0f1419;
-  }
+  .controls button#locateBtn { background: #66bb6a; color: #0f1419; }
   .controls button#locateBtn:hover { background: #81c784; }
   .controls button#locateBtn.active { background: #ef5350; color: #fff; }
+  .wind-source {
+    font-size: 12px;
+    color: #7a8fa6;
+    margin-bottom: 10px;
+    padding: 0 4px;
+  }
+  .wind-source b { color: #9eb3cc; }
   .pulse-dot {
     background: #2196f3;
     width: 16px;
@@ -141,6 +145,27 @@
     text-align: center;
     padding: 12px;
     line-height: 1.5;
+  }
+  details.override {
+    background: #1a2330;
+    border: 1px solid #2a3b4f;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-size: 13px;
+  }
+  details.override summary {
+    cursor: pointer;
+    color: #9eb3cc;
+    user-select: none;
+  }
+  details.override summary:hover { color: #4fc3f7; }
+  details.override .inner {
+    margin-top: 10px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
   }
   @media (max-width: 600px) {
     body { padding: 10px; font-size: 14px; }
@@ -165,12 +190,14 @@
   <div id="results" class="hidden">
     <div class="stats">
       <div class="stat"><div class="label">Loskoppelhoogte</div><div class="value" id="statAlt">— <span class="unit">m AGL</span></div></div>
-      <div class="stat"><div class="label">Windsnelheid</div><div class="value" id="statWs">— <span class="unit">m/s</span></div></div>
+      <div class="stat"><div class="label">Windsnelheid</div><div class="value" id="statWs">— <span class="unit">m/s @10m</span></div></div>
       <div class="stat"><div class="label">Windrichting</div><div class="value" id="statWd">— <span class="unit">°</span></div></div>
       <div class="stat"><div class="label">Valtijd</div><div class="value" id="statFall">— <span class="unit">s</span></div></div>
       <div class="stat"><div class="label">Drift</div><div class="value" id="statDrift">— <span class="unit">m</span></div></div>
-      <div class="stat"><div class="label">Zoekradius</div><div class="value" id="statRadius">— <span class="unit">m</span></div></div>
+      <div class="stat"><div class="label">Zoekgebied</div><div class="value" id="statRadius">— <span class="unit">m</span></div></div>
     </div>
+
+    <div class="wind-source" id="windSource"></div>
 
     <div class="controls">
       <label for="altInput">Loskoppelhoogte (m AGL):</label>
@@ -181,13 +208,29 @@
       <button id="locateBtn" type="button">📍 Toon mijn locatie</button>
     </div>
 
+    <details class="override">
+      <summary>Handmatige wind-override (van KNMI station of veldmeting)</summary>
+      <div class="inner">
+        <label for="manWs">Snelheid (m/s):</label>
+        <input type="number" id="manWs" min="0" max="40" step="0.5" placeholder="bv 6">
+        <label for="manWd">Richting (°, waar wind vandaan komt):</label>
+        <input type="number" id="manWd" min="0" max="360" step="5" placeholder="bv 240">
+        <button id="applyManualBtn" type="button">Toepassen</button>
+        <button id="clearManualBtn" type="button" style="background:#78909c">Reset naar model</button>
+      </div>
+      <div style="margin-top:8px;color:#7a8fa6;font-size:12px">
+        Tip: KNMI waarnemingen → <span style="color:#9eb3cc">www.knmi.nl/nederland-nu/weer/waarnemingen</span> (station 290 Twenthe).
+        DD = richting (graden, waar wind vandaan komt), FF = snelheid (deel door 10 voor m/s).
+      </div>
+    </details>
+
     <div id="map"></div>
   </div>
 
   <div class="disclaimer">
-    Dit is een schatting gebaseerd op een vereenvoudigd model (valsnelheid ~10 m/s, wind op 10 m hoogte).
-    Gebruik het zoekgebied als richtlijn — het werkelijke landingspunt kan afwijken door wind op hoogte,
-    luchtweerstand van het voorloopstuk en lokale turbulentie. Zoek systematisch binnen de rode cirkel.
+    Schatting gebaseerd op fysisch model (kwadratische luchtweerstand, windshear via 1/7 power law).
+    Werkelijke landing kan afwijken door thermiek, windgradiënt en luchtweerstandvariaties van het voorloopstuk.
+    Zoek systematisch binnen het rode ellips-gebied — de lange as ligt langs de windrichting.
   </div>
 </div>
 
@@ -195,13 +238,21 @@
 <script>
 'use strict';
 
-const DEFAULT_ALT = 350; // m AGL
-const UNCERT_ALONG = 0.28;  // ±28% along-wind (wind speed, alt, vz errors)
-const UNCERT_CROSS = 0.15;  // ±15% cross-wind (wind direction ~10° drift)
-const WIND_SHEAR_ALPHA = 0.143; // 1/7 power law exponent (open terrain)
-const SIM_DT = 0.05; // seconds
-const GRAVITY = 9.81; // m/s²
+// ---------- Physics constants ----------
+const WIND_SHEAR_ALPHA = 0.143;   // 1/7 power law (open terrain)
+const SIM_DT = 0.05;              // simulation timestep (s)
+const GRAVITY = 9.81;             // m/s²
+const UNCERT_ALONG = 0.28;        // ±28% along-wind uncertainty
+const UNCERT_CROSS = 0.15;        // ±15% cross-wind uncertainty
 
+// ---------- Data source config ----------
+// KNMI AWS station (290 = Twenthe). Change if you fly elsewhere:
+// 278=Heino, 280=Eelde, 283=Hupsel, 275=Deelen, 270=Leeuwarden, 344=Rotterdam
+const KNMI_STATION = 290;
+// URL to the nginx reverse-proxy that forwards to KNMI (same origin as this page)
+const KNMI_PROXY_URL = '/api/knmi';
+
+// ---------- Global state ----------
 const state = {
   fixes: [],
   date: null,
@@ -209,7 +260,11 @@ const state = {
   groundAlt: 0,
   windSpeed10: null,
   windDir10: null,
-  descentSpeed: 28, // terminal velocity (m/s) for bare voorloopstuk
+  windSource: '',
+  modelWindSpeed: null,  // keeps model value so "reset" restores it
+  modelWindDir: null,
+  modelWindSource: '',
+  descentSpeed: 28,
   map: null,
   layers: [],
   watchId: null,
@@ -226,10 +281,9 @@ const fileInput = $('fileInput');
 function showStatus(msg, type='info') {
   statusEl.className = 'status ' + type;
   statusEl.textContent = msg;
-  statusEl.classList.remove('hidden');
 }
-function clearStatus() { statusEl.className=''; statusEl.textContent=''; }
 
+// ---------- UI wiring ----------
 dropzone.addEventListener('click', () => fileInput.click());
 dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
 dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
@@ -243,71 +297,35 @@ fileInput.addEventListener('change', e => {
 });
 $('recalcBtn').addEventListener('click', () => {
   const v = parseFloat($('altInput').value);
-  if (!isNaN(v) && v > 0) {
-    recalculate(v);
+  if (!isNaN(v) && v > 0) recalculate(v);
+});
+$('applyManualBtn').addEventListener('click', () => {
+  const ws = parseFloat($('manWs').value);
+  const wd = parseFloat($('manWd').value);
+  if (isNaN(ws) || isNaN(wd)) {
+    showStatus('Vul snelheid en richting in.', 'error');
+    return;
+  }
+  state.windSpeed10 = ws;
+  state.windDir10 = ((wd % 360) + 360) % 360;
+  state.windSource = `Handmatig: ${ws.toFixed(1)} m/s uit ${Math.round(state.windDir10)}°`;
+  const altAGL = parseFloat($('altInput').value);
+  if (!isNaN(altAGL)) recalculate(altAGL);
+});
+$('clearManualBtn').addEventListener('click', () => {
+  if (state.modelWindSpeed != null) {
+    state.windSpeed10 = state.modelWindSpeed;
+    state.windDir10 = state.modelWindDir;
+    state.windSource = state.modelWindSource;
+    $('manWs').value = '';
+    $('manWd').value = '';
+    const altAGL = parseFloat($('altInput').value);
+    if (!isNaN(altAGL)) recalculate(altAGL);
   }
 });
 $('locateBtn').addEventListener('click', toggleLocation);
 
-function toggleLocation() {
-  const btn = $('locateBtn');
-  if (state.watchId != null) {
-    navigator.geolocation.clearWatch(state.watchId);
-    state.watchId = null;
-    if (state.userMarker) { state.map.removeLayer(state.userMarker); state.userMarker = null; }
-    if (state.userAccCircle) { state.map.removeLayer(state.userAccCircle); state.userAccCircle = null; }
-    btn.classList.remove('active');
-    btn.textContent = '📍 Toon mijn locatie';
-    return;
-  }
-  if (!navigator.geolocation) {
-    showStatus('Geolocation wordt niet ondersteund door deze browser.', 'error');
-    return;
-  }
-  if (!state.map) {
-    showStatus('Laad eerst een IGC bestand zodat de kaart zichtbaar is.', 'error');
-    return;
-  }
-  btn.textContent = '📍 Locatie zoeken...';
-  state.watchId = navigator.geolocation.watchPosition(
-    pos => {
-      const { latitude, longitude, accuracy } = pos.coords;
-      const latlng = [latitude, longitude];
-      if (!state.userMarker) {
-        const icon = L.divIcon({
-          className: '',
-          html: '<div class="pulse-dot"></div>',
-          iconSize: [16,16],
-          iconAnchor: [8,8]
-        });
-        state.userMarker = L.marker(latlng, { icon }).bindPopup('Jouw locatie').addTo(state.map);
-        state.userAccCircle = L.circle(latlng, {
-          radius: accuracy,
-          color: '#2196f3',
-          fillColor: '#2196f3',
-          fillOpacity: 0.1,
-          weight: 1
-        }).addTo(state.map);
-        // Zoom to show both user and search area
-        const group = L.featureGroup([state.userMarker, ...state.layers]);
-        state.map.fitBounds(group.getBounds().pad(0.2));
-      } else {
-        state.userMarker.setLatLng(latlng);
-        state.userAccCircle.setLatLng(latlng).setRadius(accuracy);
-      }
-      btn.classList.add('active');
-      btn.textContent = '📍 Stop locatie';
-    },
-    err => {
-      showStatus('Locatie fout: ' + err.message, 'error');
-      state.watchId = null;
-      btn.classList.remove('active');
-      btn.textContent = '📍 Toon mijn locatie';
-    },
-    { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 }
-  );
-}
-
+// ---------- IGC parsing ----------
 async function handleFile(file) {
   try {
     showStatus('IGC bestand lezen...', 'info');
@@ -318,7 +336,7 @@ async function handleFile(file) {
       return;
     }
     detectRelease();
-    showStatus('Winddata ophalen van Open-Meteo...', 'info');
+    showStatus('Winddata ophalen (KNMI HARMONIE via Open-Meteo)...', 'info');
     await fetchWind();
     showStatus('Berekening gereed.', 'success');
     resultsEl.classList.remove('hidden');
@@ -336,10 +354,8 @@ function parseIGC(text) {
   const lines = text.split(/\r?\n/);
   state.fixes = [];
   state.date = null;
-
   for (const line of lines) {
     if (line.startsWith('HFDTE')) {
-      // HFDTE DDMMYY  or HFDTEDATE:DDMMYY,NN
       const m = line.match(/(\d{2})(\d{2})(\d{2})/);
       if (m) {
         const dd = m[1], mm = m[2], yy = m[3];
@@ -347,7 +363,6 @@ function parseIGC(text) {
         state.date = `${year}-${mm}-${dd}`;
       }
     } else if (line.startsWith('B') && line.length >= 35) {
-      // B HHMMSS DDMMmmmN DDDMMmmmE A PPPPP GGGGG
       const hh = parseInt(line.substr(1,2));
       const mi = parseInt(line.substr(3,2));
       const ss = parseInt(line.substr(5,2));
@@ -361,7 +376,6 @@ function parseIGC(text) {
       const lonHem = line.substr(23,1);
       let lon = lonDeg + lonMin/60;
       if (lonHem === 'W') lon = -lon;
-      const validity = line.substr(24,1);
       const pressAlt = parseInt(line.substr(25,5));
       const gpsAlt = parseInt(line.substr(30,5));
       const alt = gpsAlt || pressAlt;
@@ -372,8 +386,7 @@ function parseIGC(text) {
     }
   }
   if (!state.date && state.fixes.length) {
-    const today = new Date();
-    state.date = today.toISOString().slice(0,10);
+    state.date = new Date().toISOString().slice(0,10);
   }
 }
 
@@ -381,9 +394,9 @@ function detectRelease() {
   const fixes = state.fixes;
   if (fixes.length < 2) throw new Error('Te weinig GPS fixes.');
 
-  // Ground altitude = minimum of first 10 fixes (robust against GPS noise)
-  // Using GPS alt of a fix on the ground means AGL is computed in the same
-  // frame (ellipsoidal or MSL), avoiding the geoid correction problem.
+  // Ground altitude = min of first 10 fixes (robust against GPS noise;
+  // stays in same frame as release fix so AGL is correct regardless
+  // of whether logger outputs MSL or WGS84 ellipsoidal altitude)
   let groundAlt = Infinity;
   const nGround = Math.min(10, fixes.length);
   for (let i = 0; i < nGround; i++) {
@@ -391,7 +404,7 @@ function detectRelease() {
   }
   state.groundAlt = groundAlt;
 
-  // Compute climb rate over 3s window
+  // Climb rate over 3-second window
   const climb = [];
   for (let i = 0; i < fixes.length; i++) {
     let j = i;
@@ -402,7 +415,6 @@ function detectRelease() {
   }
 
   const t0 = fixes[0].t;
-  // Look within first 200s
   let peakIdx = -1, peakVal = -Infinity;
   for (let i = 0; i < fixes.length; i++) {
     if (fixes[i].t - t0 > 200) break;
@@ -418,65 +430,174 @@ function detectRelease() {
     state.releaseIdx = hiIdx;
     return;
   }
-
-  // First fix after peak where climb drops below 1.5 m/s
   for (let i = peakIdx; i < fixes.length; i++) {
     if (fixes[i].t - t0 > 200) break;
-    if (climb[i] < 1.5) {
-      state.releaseIdx = i;
-      return;
-    }
+    if (climb[i] < 1.5) { state.releaseIdx = i; return; }
   }
   state.releaseIdx = peakIdx;
 }
 
+// ---------- Wind data ----------
+// Try to fetch measured wind from KNMI AWS station via the nginx proxy.
+// Returns { speed, dir, source } on success, or null on any failure.
+async function fetchKNMIStation(flightHourFrac) {
+  try {
+    const [y, m, d] = state.date.split('-');
+    // Request the full day so we have all hours available
+    const start = `${y}${m}${d}01`;
+    const end = `${y}${m}${d}24`;
+    const url = `${KNMI_PROXY_URL}?stns=${KNMI_STATION}&vars=DD:FF&start=${start}&end=${end}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const text = await res.text();
+
+    // Parse CSV. Comment lines start with #. Data lines look like:
+    //   290,20250411,   13,  240,   65
+    // Fields: STN, YYYYMMDD, HH, DD (deg), FF (0.1 m/s)
+    const rows = [];
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const parts = t.split(/\s*,\s*/);
+      if (parts.length < 5) continue;
+      const stn = parseInt(parts[0]);
+      if (stn !== KNMI_STATION) continue;
+      const hh = parseInt(parts[2]);
+      const dd = parseInt(parts[3]);
+      const ff = parseInt(parts[4]);
+      if (isNaN(hh) || isNaN(dd) || isNaN(ff)) continue;
+      rows.push({ hh, dd, ff: ff / 10 });
+    }
+    if (rows.length === 0) return null;
+
+    // KNMI convention: HH is the END of the hour-period in UT.
+    //   HH=13 means data averaged over 12:00-13:00 UT
+    // So for a flight at flightHourFrac = 12.37 UT we want HH = 13
+    const clockHour = Math.floor(flightHourFrac);
+    const targetHH = clockHour + 1;
+    const row = rows.find(r => r.hh === targetHH);
+    if (!row) return null;
+    // DD = 0 means calm, DD = 990 means variable — treat both as unusable
+    if (row.dd === 0 || row.dd === 990) return null;
+    return {
+      speed: row.ff,
+      dir: row.dd,
+      source: `KNMI station ${KNMI_STATION} ${state.date} ${String(clockHour).padStart(2,'0')}:00-${String(targetHH).padStart(2,'0')}:00Z (gemeten)`
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function fetchWind() {
   const fix = state.fixes[state.releaseIdx];
+  const flightHourFrac = fix.t / 3600;
+
+  // FIRST try real measured data from KNMI AWS station via nginx proxy
+  const knmi = await fetchKNMIStation(flightHourFrac);
+  if (knmi) {
+    state.modelWindSpeed = knmi.speed;
+    state.modelWindDir = knmi.dir;
+    state.modelWindSource = knmi.source;
+    state.windSpeed10 = knmi.speed;
+    state.windDir10 = knmi.dir;
+    state.windSource = knmi.source;
+    return;
+  }
+
+  // Fall back to Open-Meteo (KNMI HARMONIE model, then ERA5)
   const flightDate = new Date(state.date);
   const now = new Date();
   const daysAgo = (now - flightDate) / (1000 * 60 * 60 * 24);
-  const useArchive = daysAgo > 5;
-  const base = useArchive
-    ? 'https://archive-api.open-meteo.com/v1/archive'
-    : 'https://api.open-meteo.com/v1/forecast';
-  // IMPORTANT: timezone=UTC so we can match flight hour (which is UTC from IGC) directly
-  const url = `${base}?latitude=${fix.lat.toFixed(4)}&longitude=${fix.lon.toFixed(4)}&hourly=windspeed_10m,winddirection_10m&wind_speed_unit=ms&start_date=${state.date}&end_date=${state.date}&timezone=UTC`;
-  let res = await fetch(url);
-  if (!res.ok && !useArchive) {
-    const fallback = `https://archive-api.open-meteo.com/v1/archive?latitude=${fix.lat.toFixed(4)}&longitude=${fix.lon.toFixed(4)}&hourly=windspeed_10m,winddirection_10m&wind_speed_unit=ms&start_date=${state.date}&end_date=${state.date}&timezone=UTC`;
-    res = await fetch(fallback);
+
+  // Try endpoints in order of preference for Netherlands:
+  // 1. historical-forecast-api with KNMI HARMONIE model (2.5km, NL-specific)
+  // 2. Regular forecast API with KNMI model (recent flights)
+  // 3. ERA5 archive as final fallback (25km global reanalysis)
+  const lat = fix.lat.toFixed(4);
+  const lon = fix.lon.toFixed(4);
+  const d = state.date;
+  const commonParams = `latitude=${lat}&longitude=${lon}&hourly=windspeed_10m,winddirection_10m&wind_speed_unit=ms&start_date=${d}&end_date=${d}&timezone=UTC`;
+
+  const attempts = [];
+  if (daysAgo < 0 || daysAgo < 7) {
+    attempts.push({
+      url: `https://api.open-meteo.com/v1/forecast?${commonParams}&models=knmi_seamless`,
+      source: 'KNMI HARMONIE (2.5km, forecast)'
+    });
   }
-  if (!res.ok) throw new Error('Winddata kon niet opgehaald worden (' + res.status + ').');
-  const data = await res.json();
+  attempts.push({
+    url: `https://historical-forecast-api.open-meteo.com/v1/forecast?${commonParams}&models=knmi_seamless`,
+    source: 'KNMI HARMONIE (2.5km, historical)'
+  });
+  attempts.push({
+    url: `https://archive-api.open-meteo.com/v1/archive?${commonParams}`,
+    source: 'ERA5 reanalyse (25km)'
+  });
+
+  let data = null, usedSource = '';
+  for (const a of attempts) {
+    try {
+      const res = await fetch(a.url);
+      if (!res.ok) continue;
+      const j = await res.json();
+      if (j.hourly && j.hourly.time && j.hourly.time.length > 0
+          && j.hourly.windspeed_10m && j.hourly.windspeed_10m[0] != null) {
+        data = j;
+        usedSource = a.source;
+        break;
+      }
+    } catch (e) { /* try next */ }
+  }
+  if (!data) throw new Error('Geen winddata beschikbaar voor deze datum/locatie.');
+
   const times = data.hourly.time;
   const ws = data.hourly.windspeed_10m;
   const wd = data.hourly.winddirection_10m;
 
-  // Flight time is in UTC (IGC B-records are always UTC).
-  // Open-Meteo now also returns UTC, so match hour-of-day directly.
-  const flightHourUTC = Math.floor(fix.t / 3600) % 24;
-  let bestIdx = 0, bestDiff = Infinity;
+  // Flight time in UTC (IGC is always UTC; we requested timezone=UTC from API)
+  // Linearly interpolate between the two hours surrounding the flight time
+  const flightHourInt = Math.floor(flightHourFrac) % 24;
+  let idx0 = -1;
   for (let i = 0; i < times.length; i++) {
     const h = parseInt(times[i].substr(11, 2));
-    const diff = Math.abs(h - flightHourUTC);
-    if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+    if (h === flightHourInt) { idx0 = i; break; }
   }
-  state.windSpeed10 = ws[bestIdx];
-  state.windDir10 = wd[bestIdx];
+  if (idx0 < 0) idx0 = 0;
+  const idx1 = Math.min(idx0 + 1, times.length - 1);
+  const frac = flightHourFrac - Math.floor(flightHourFrac); // 0..1
+
+  // Interpolate wind speed linearly, direction via vector components
+  // (avoids 359°/1° wrap-around averaging errors)
+  const ws0 = ws[idx0], ws1 = ws[idx1];
+  const wd0 = wd[idx0] * Math.PI / 180;
+  const wd1 = wd[idx1] * Math.PI / 180;
+  const u0 = ws0 * Math.sin(wd0), v0 = ws0 * Math.cos(wd0);
+  const u1 = ws1 * Math.sin(wd1), v1 = ws1 * Math.cos(wd1);
+  const uI = u0 + (u1 - u0) * frac;
+  const vI = v0 + (v1 - v0) * frac;
+  const speed = Math.sqrt(uI * uI + vI * vI);
+  const dir = (Math.atan2(uI, vI) * 180 / Math.PI + 360) % 360;
+
+  const hh = String(Math.floor(flightHourFrac)).padStart(2,'0');
+  const mm = String(Math.floor((flightHourFrac % 1) * 60)).padStart(2,'0');
+  state.modelWindSpeed = speed;
+  state.modelWindDir = dir;
+  state.modelWindSource = `${usedSource} op ${d} ${hh}:${mm}Z (geïnterpoleerd)`;
+  state.windSpeed10 = speed;
+  state.windDir10 = dir;
+  state.windSource = state.modelWindSource;
 }
 
-// Wind at given altitude (m AGL) using power-law shear
+// ---------- Physics helpers ----------
+// Wind speed at altitude h (m AGL) via 1/7 power law. Direction assumed constant.
 function windAt(altAGL) {
   const h = Math.max(altAGL, 2);
   const scale = Math.pow(h / 10, WIND_SHEAR_ALPHA);
-  return {
-    speed: state.windSpeed10 * scale,
-    dir: state.windDir10
-  };
+  return { speed: state.windSpeed10 * scale, dir: state.windDir10 };
 }
 
-// Compute initial horizontal velocity of voorloopstuk at release
-// (it carries the glider's forward velocity for a brief moment)
+// Initial horizontal velocity of voorloopstuk at release (glider forward speed)
 function initialVelocity() {
   const i = state.releaseIdx;
   const a = state.fixes[Math.max(0, i - 3)];
@@ -489,69 +610,46 @@ function initialVelocity() {
   return { vx: dx / dt, vy: dy / dt };
 }
 
-// Vertical climb rate at release (glider may still be climbing, giving
-// the voorloopstuk initial upward momentum that must be overcome by gravity)
+// Glider climb rate at release — voorloopstuk inherits this upward velocity
 function initialClimbRate() {
   const i = state.releaseIdx;
   const a = state.fixes[Math.max(0, i - 3)];
   const b = state.fixes[Math.min(state.fixes.length - 1, i)];
   const dt = b.t - a.t;
   if (dt <= 0) return 0;
-  return (b.alt - a.alt) / dt; // positive = climbing
+  return (b.alt - a.alt) / dt;
 }
 
-// Numerical trajectory simulation with 3D-coupled quadratic drag.
-//
-// Physics: drag force F = -½·ρ·Cd·A·|v_rel|·v_rel (vector).
-// Per unit mass, this equals -(g/vt²)·|v_rel|·v_rel, where vt is the
-// terminal velocity in pure vertical free-fall. The same coefficient
-// applies to all three axes (we model the voorloopstuk as isotropic
-// when tumbling). Gravity acts only on the z-axis.
-//
-// v_rel = (object velocity) - (air velocity). Air has wind in x,y
-// and zero vertical motion. This is physically consistent: horizontal
-// motion through the air adds to |v_rel|, which increases drag on ALL
-// axes, so fast horizontal motion slightly delays vertical acceleration.
-//
-// Coordinate convention:
-//   x = east (m), y = north (m), z = down (m); positive vz = falling.
-//   Wind direction from meteo API = direction wind comes FROM.
-//
-// Returns array of {x, y, h} plus points.totalTime.
+// 3D-coupled quadratic drag simulation.
+// F_drag = -½·ρ·Cd·A·|v_rel|·v_rel  →  a_drag = -(g/vt²)·|v_rel|·v_rel
+// Gravity acts on z-axis only. Wind shear scales horizontal air velocity with altitude.
+// Coordinates: x=east, y=north, z=down (positive vz = falling).
 function simulateTrajectory(altAGL) {
   const v0 = initialVelocity();
   const climb0 = initialClimbRate();
-  const vt = state.descentSpeed;         // terminal velocity in pure fall
-  const k = GRAVITY / (vt * vt);         // drag coefficient (1/m)
+  const vt = state.descentSpeed;
+  const k = GRAVITY / (vt * vt);
 
   let x = 0, y = 0, h = altAGL;
-  let vx = v0.vx, vy = v0.vy;            // horizontal velocity (m/s)
-  let vz = -climb0;                      // start negative if glider still climbing
+  let vx = v0.vx, vy = v0.vy;
+  let vz = -climb0; // negative if glider still climbing
   const points = [{ x, y, h }];
   let t = 0;
 
   while (h > 0 && t < 300) {
-    // Air velocity at current altitude (wind shear via 1/7 power law)
     const w = windAt(h);
     const wdRad = w.dir * Math.PI / 180;
     const vax = -w.speed * Math.sin(wdRad);
     const vay = -w.speed * Math.cos(wdRad);
-    // Air vertical velocity assumed 0
 
-    // Relative velocity (object - air)
     const vrx = vx - vax;
     const vry = vy - vay;
     const vrz = vz;
     const vrel = Math.sqrt(vrx*vrx + vry*vry + vrz*vrz);
 
-    // 3D quadratic drag, plus gravity on z-axis
-    const ax = -k * vrel * vrx;
-    const ay = -k * vrel * vry;
-    const az = GRAVITY - k * vrel * vrz;
-
-    vx += ax * SIM_DT;
-    vy += ay * SIM_DT;
-    vz += az * SIM_DT;
+    vx += -k * vrel * vrx * SIM_DT;
+    vy += -k * vrel * vry * SIM_DT;
+    vz += (GRAVITY - k * vrel * vrz) * SIM_DT;
 
     x += vx * SIM_DT;
     y += vy * SIM_DT;
@@ -563,28 +661,57 @@ function simulateTrajectory(altAGL) {
   return points;
 }
 
+// Spherical forward geodesic (haversine)
+function offsetLatLon(lat, lon, distM, bearingDeg) {
+  const R = 6378137;
+  const br = bearingDeg * Math.PI / 180;
+  const lat1 = lat * Math.PI / 180;
+  const lon1 = lon * Math.PI / 180;
+  const lat2 = Math.asin(Math.sin(lat1)*Math.cos(distM/R) + Math.cos(lat1)*Math.sin(distM/R)*Math.cos(br));
+  const lon2 = lon1 + Math.atan2(Math.sin(br)*Math.sin(distM/R)*Math.cos(lat1), Math.cos(distM/R)-Math.sin(lat1)*Math.sin(lat2));
+  return { lat: lat2*180/Math.PI, lon: lon2*180/Math.PI };
+}
+
+// Build polygon approximating an ellipse oriented along `bearingDeg`
+function buildEllipse(lat, lon, a, b, bearingDeg) {
+  const pts = [];
+  const n = 48;
+  const brRad = bearingDeg * Math.PI / 180;
+  const cosB = Math.cos(brRad), sinB = Math.sin(brRad);
+  for (let i = 0; i <= n; i++) {
+    const theta = (i / n) * 2 * Math.PI;
+    const u = a * Math.cos(theta);
+    const v = b * Math.sin(theta);
+    const east = u * sinB + v * cosB;
+    const north = u * cosB - v * sinB;
+    const dist = Math.sqrt(east*east + north*north);
+    const bear = (Math.atan2(east, north) * 180 / Math.PI + 360) % 360;
+    const ll = offsetLatLon(lat, lon, dist, bear);
+    pts.push([ll.lat, ll.lon]);
+  }
+  return pts;
+}
+
+// ---------- Main calculation ----------
 function recalculate(altAGL) {
   const fix = state.fixes[state.releaseIdx];
-  state.descentSpeed = parseFloat($('vzInput').value) || 7;
+  state.descentSpeed = parseFloat($('vzInput').value) || 28;
 
   const traj = simulateTrajectory(altAGL);
   const end = traj[traj.length - 1];
   const driftDist = Math.sqrt(end.x * end.x + end.y * end.y);
   const fallTime = traj.totalTime;
-
-  // Convert simulation endpoint (meters east/north) to lat/lon
   const bearing = (Math.atan2(end.x, end.y) * 180 / Math.PI + 360) % 360;
   const dest = offsetLatLon(fix.lat, fix.lon, driftDist, bearing);
 
-  // Uncertainty ellipse: stretched along wind drift direction
   const semiAlong = Math.max(driftDist * UNCERT_ALONG, 50);
   const semiCross = Math.max(driftDist * UNCERT_CROSS, 35);
   const ellipsePts = buildEllipse(dest.lat, dest.lon, semiAlong, semiCross, bearing);
 
-  // Convert trajectory to lat/lon points for drawing
   const trajLL = traj.map(p => {
-    const d = Math.sqrt(p.x * p.x + p.y * p.y);
-    if (d < 0.1) return [fix.lat, fix.lon];
+    const dsq = p.x * p.x + p.y * p.y;
+    if (dsq < 0.01) return [fix.lat, fix.lon];
+    const d = Math.sqrt(dsq);
     const b = (Math.atan2(p.x, p.y) * 180 / Math.PI + 360) % 360;
     const ll = offsetLatLon(fix.lat, fix.lon, d, b);
     return [ll.lat, ll.lon];
@@ -596,43 +723,12 @@ function recalculate(altAGL) {
   $('statFall').innerHTML = fallTime.toFixed(1) + ' <span class="unit">s</span>';
   $('statDrift').innerHTML = Math.round(driftDist) + ' <span class="unit">m</span>';
   $('statRadius').innerHTML = Math.round(semiAlong) + '×' + Math.round(semiCross) + ' <span class="unit">m</span>';
+  $('windSource').innerHTML = '<b>Wind bron:</b> ' + state.windSource;
 
   drawMap(fix, dest, ellipsePts, trajLL);
 }
 
-// Build a polygon approximating an ellipse centered at (lat,lon),
-// with semi-major axis `a` along `bearingDeg` and semi-minor `b` perpendicular.
-function buildEllipse(lat, lon, a, b, bearingDeg) {
-  const pts = [];
-  const n = 48;
-  const brRad = bearingDeg * Math.PI / 180;
-  const cosB = Math.cos(brRad), sinB = Math.sin(brRad);
-  for (let i = 0; i <= n; i++) {
-    const theta = (i / n) * 2 * Math.PI;
-    // Local ellipse coords: u along major axis, v along minor
-    const u = a * Math.cos(theta);
-    const v = b * Math.sin(theta);
-    // Rotate so u points along bearing (y=north axis rotated by bearing)
-    const east = u * sinB + v * cosB;
-    const north = u * cosB - v * sinB;
-    const dist = Math.sqrt(east*east + north*north);
-    const bear = (Math.atan2(east, north) * 180 / Math.PI + 360) % 360;
-    const ll = offsetLatLon(lat, lon, dist, bear);
-    pts.push([ll.lat, ll.lon]);
-  }
-  return pts;
-}
-
-function offsetLatLon(lat, lon, distM, bearingDeg) {
-  const R = 6378137;
-  const br = bearingDeg * Math.PI / 180;
-  const lat1 = lat * Math.PI / 180;
-  const lon1 = lon * Math.PI / 180;
-  const lat2 = Math.asin(Math.sin(lat1)*Math.cos(distM/R) + Math.cos(lat1)*Math.sin(distM/R)*Math.cos(br));
-  const lon2 = lon1 + Math.atan2(Math.sin(br)*Math.sin(distM/R)*Math.cos(lat1), Math.cos(distM/R)-Math.sin(lat1)*Math.sin(lat2));
-  return { lat: lat2*180/Math.PI, lon: lon2*180/Math.PI };
-}
-
+// ---------- Map rendering ----------
 function drawMap(releaseFix, dest, ellipsePts, trajLL) {
   if (!state.map) {
     state.map = L.map('map').setView([releaseFix.lat, releaseFix.lon], 15);
@@ -641,11 +737,10 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL) {
       maxZoom: 19
     }).addTo(state.map);
   }
-  // Clear previous layers
   for (const l of state.layers) state.map.removeLayer(l);
   state.layers = [];
 
-  // Flight track first 5 minutes
+  // Flight track first 5 minutes (blue)
   const t0 = state.fixes[0].t;
   const trackPts = state.fixes
     .filter(f => f.t - t0 <= 300)
@@ -655,13 +750,10 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL) {
     state.layers.push(track);
   }
 
-  // Voorloopstuk trajectory (orange dashed)
+  // Fall trajectory (orange dashed)
   if (trajLL && trajLL.length > 1) {
     const trajLine = L.polyline(trajLL, {
-      color: '#ffb74d',
-      weight: 2,
-      opacity: 0.85,
-      dashArray: '5,6'
+      color: '#ffb74d', weight: 2, opacity: 0.85, dashArray: '5,6'
     }).bindPopup('Berekende valbaan').addTo(state.map);
     state.layers.push(trajLine);
   }
@@ -670,38 +762,87 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL) {
   const releaseIcon = L.divIcon({
     className: '',
     html: '<div style="background:#ffd54f;width:18px;height:18px;border-radius:50%;border:3px solid #0f1419;box-shadow:0 0 0 2px #ffd54f;"></div>',
-    iconSize: [18,18],
-    iconAnchor: [9,9]
+    iconSize: [18,18], iconAnchor: [9,9]
   });
   const releaseMarker = L.marker([releaseFix.lat, releaseFix.lon], { icon: releaseIcon })
     .bindPopup('Loskoppelpunt')
     .addTo(state.map);
   state.layers.push(releaseMarker);
 
-  // Search ellipse (red, stretched along drift axis)
+  // Search ellipse (red)
   const ellipse = L.polygon(ellipsePts, {
-    color: '#ef5350',
-    fillColor: '#ef5350',
-    fillOpacity: 0.22,
-    weight: 2
+    color: '#ef5350', fillColor: '#ef5350', fillOpacity: 0.22, weight: 2
   }).bindPopup('Geschat zoekgebied').addTo(state.map);
   state.layers.push(ellipse);
 
-  // Center marker for search
+  // Center marker
   const centerIcon = L.divIcon({
     className: '',
     html: '<div style="background:#ef5350;width:10px;height:10px;border-radius:50%;border:2px solid #fff;"></div>',
-    iconSize: [10,10],
-    iconAnchor: [5,5]
+    iconSize: [10,10], iconAnchor: [5,5]
   });
   const centerMarker = L.marker([dest.lat, dest.lon], { icon: centerIcon }).addTo(state.map);
   state.layers.push(centerMarker);
 
-  // Fit bounds around release point and the whole search ellipse
   const bounds = L.latLngBounds([[releaseFix.lat, releaseFix.lon]]);
   for (const p of ellipsePts) bounds.extend(p);
   state.map.fitBounds(bounds.pad(0.3));
   setTimeout(() => state.map.invalidateSize(), 100);
+}
+
+// ---------- Geolocation ----------
+function toggleLocation() {
+  const btn = $('locateBtn');
+  if (state.watchId != null) {
+    navigator.geolocation.clearWatch(state.watchId);
+    state.watchId = null;
+    if (state.userMarker) { state.map.removeLayer(state.userMarker); state.userMarker = null; }
+    if (state.userAccCircle) { state.map.removeLayer(state.userAccCircle); state.userAccCircle = null; }
+    btn.classList.remove('active');
+    btn.textContent = '📍 Toon mijn locatie';
+    return;
+  }
+  if (!navigator.geolocation) {
+    showStatus('Geolocation wordt niet ondersteund.', 'error');
+    return;
+  }
+  if (!state.map) {
+    showStatus('Laad eerst een IGC bestand.', 'error');
+    return;
+  }
+  btn.textContent = '📍 Locatie zoeken...';
+  state.watchId = navigator.geolocation.watchPosition(
+    pos => {
+      const { latitude, longitude, accuracy } = pos.coords;
+      const latlng = [latitude, longitude];
+      if (!state.userMarker) {
+        const icon = L.divIcon({
+          className: '',
+          html: '<div class="pulse-dot"></div>',
+          iconSize: [16,16], iconAnchor: [8,8]
+        });
+        state.userMarker = L.marker(latlng, { icon }).bindPopup('Jouw locatie').addTo(state.map);
+        state.userAccCircle = L.circle(latlng, {
+          radius: accuracy, color: '#2196f3', fillColor: '#2196f3',
+          fillOpacity: 0.1, weight: 1
+        }).addTo(state.map);
+        const group = L.featureGroup([state.userMarker, ...state.layers]);
+        state.map.fitBounds(group.getBounds().pad(0.2));
+      } else {
+        state.userMarker.setLatLng(latlng);
+        state.userAccCircle.setLatLng(latlng).setRadius(accuracy);
+      }
+      btn.classList.add('active');
+      btn.textContent = '📍 Stop locatie';
+    },
+    err => {
+      showStatus('Locatie fout: ' + err.message, 'error');
+      state.watchId = null;
+      btn.classList.remove('active');
+      btn.textContent = '📍 Toon mijn locatie';
+    },
+    { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 }
+  );
 }
 </script>
 </body>
