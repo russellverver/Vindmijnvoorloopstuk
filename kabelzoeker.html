@@ -429,65 +429,107 @@ function parseIGC(text) {
 
 // Extract wind aloft uit het IGC-bestand via mean-of-circle-drift: in cirkels
 // middelt de eigen luchtsnelheid (TAS) uit, dus mean(groundspeed-vector) over
-// een volle 360° = wind-velocity-vector. Dit is een DIRECTE meting van de wind
-// op release-hoogte uit de eigen vlucht — veruit de meest accurate bron.
+// een volle 360° = wind-velocity-vector. Directe in-situ meting — beste bron.
+//
+// Pipeline (na lessons-learned 2026-06-23):
+//   1. Bouw segments van releaseIdx tot einde, met dx/dy/dt/heading per fix.
+//   2. Detecteer waar TIGHT cirkels beginnen: 60s-window met >360° rotatie EN
+//      netto-verplaatsing <200m. Dit skip't de post-release glide-fase die de
+//      pilot vaak doet voordat 'ie thermal vindt (kan 60-120s duren).
+//   3. Skip eerste 30s NA detectie (settling-time — bank stabiliseren, eerste
+//      cirkel-segment vervormd). Zonder skip: 35° fout. Met 30s skip: 6° fout.
+//   4. Pak window van max 180s, getrunceerd op INTEGER cirkels (TAS middelt
+//      alleen exact uit over volle 360°).
+//   5. Vereist ≥2 volle cirkels (720°) en wind-snelheid <15 m/s (sanity).
 function extractWindFromIGC() {
   if (state.releaseIdx == null || state.fixes.length < 30) return null;
   const fixes = state.fixes;
   const start = state.releaseIdx;
-  if (start >= fixes.length - 20) return null;
+  if (start >= fixes.length - 30) return null;
 
-  const tStart = fixes[start].t;
-  // Window: tot 180s na release scannen
-  let endIdx = start;
-  while (endIdx < fixes.length - 1 && fixes[endIdx].t - tStart < 180) endIdx++;
-  if (endIdx - start < 20) return null;
-
-  // Per fix-interval: dx/dy (m), dt, heading, midden-altitude
-  const segs = [];
-  for (let i = start; i < endIdx; i++) {
+  // Alle segments vanaf release
+  const allSegs = [];
+  for (let i = start; i < fixes.length - 1; i++) {
     const a = fixes[i], b = fixes[i + 1];
     const dt = b.t - a.t;
     if (dt <= 0 || dt > 10) continue;
     const latMid = (a.lat + b.lat) / 2 * Math.PI / 180;
     const dy = (b.lat - a.lat) * 111320;
     const dx = (b.lon - a.lon) * 111320 * Math.cos(latMid);
-    segs.push({
+    allSegs.push({
       dt, dx, dy,
       hdg: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360,
       alt: (a.alt + b.alt) / 2,
     });
   }
-  if (segs.length < 20) return null;
-
-  // Som ondertekende heading-veranderingen (met wrap) → totaal aantal graden
-  // rotatie. Min. 350° vereist (één volle cirkel) voor betrouwbare wind-meting.
-  let totalRotation = 0;
-  for (let i = 1; i < segs.length; i++) {
-    let dh = segs[i].hdg - segs[i - 1].hdg;
+  if (allSegs.length < 30) return null;
+  for (let i = 1; i < allSegs.length; i++) {
+    let dh = allSegs[i].hdg - allSegs[i - 1].hdg;
     if (dh > 180) dh -= 360;
     if (dh < -180) dh += 360;
-    totalRotation += dh;
+    allSegs[i].dh = dh;
   }
-  if (Math.abs(totalRotation) < 350) return null;
+  allSegs[0].dh = 0;
 
-  // Mean groundspeed-vector (gewogen op dt) = wind TO-vector.
-  let sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0;
+  // Detecteer start van tight circling
+  let circStart = -1;
+  for (let i = 0; i < allSegs.length; i++) {
+    let cumDh = 0, cumDt = 0, sumDx = 0, sumDy = 0, j = i;
+    while (j < allSegs.length && cumDt < 60) {
+      cumDh += allSegs[j].dh;
+      cumDt += allSegs[j].dt;
+      sumDx += allSegs[j].dx;
+      sumDy += allSegs[j].dy;
+      j++;
+    }
+    if (cumDt < 50) continue;
+    if (Math.abs(cumDh) > 360 && Math.sqrt(sumDx * sumDx + sumDy * sumDy) < 200) {
+      circStart = i;
+      break;
+    }
+  }
+  if (circStart < 0) return null;
+
+  // Skip 30s settling
+  let adjStart = circStart, tSkip = 0;
+  while (adjStart < allSegs.length && tSkip < 30) {
+    tSkip += allSegs[adjStart].dt;
+    adjStart++;
+  }
+  if (adjStart >= allSegs.length - 20) return null;
+
+  // Integer-cirkels window, max 180s
+  let cumRot = 0, lastWholeIdx = -1, prevMult = 0, accT = 0;
+  for (let i = adjStart; i < allSegs.length; i++) {
+    if (accT >= 180) break;
+    cumRot += allSegs[i].dh;
+    const curMult = Math.trunc(cumRot / 360);
+    if (curMult !== prevMult) {
+      lastWholeIdx = i;
+      prevMult = curMult;
+    }
+    accT += allSegs[i].dt;
+  }
+  if (lastWholeIdx < 0) return null;
+
+  const segs = allSegs.slice(adjStart, lastWholeIdx + 1);
+  let totalRotation = 0, sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0;
   for (const s of segs) {
+    totalRotation += s.dh;
     sumDx += s.dx;
     sumDy += s.dy;
     sumDt += s.dt;
     sumAlt += s.alt * s.dt;
   }
-  if (sumDt === 0) return null;
+  if (Math.abs(totalRotation) < 720) return null;
+
   const meanU_to = sumDx / sumDt;
   const meanV_to = sumDy / sumDt;
   const speed = Math.sqrt(meanU_to * meanU_to + meanV_to * meanV_to);
-  // FROM-richting = TO + 180° (meteo conventie)
+  if (speed > 15) return null;
   const toDir = (Math.atan2(meanU_to, meanV_to) * 180 / Math.PI + 360) % 360;
   const fromDir = (toDir + 180) % 360;
-  const meanAlt = sumAlt / sumDt;
-  const altAGL = Math.round(meanAlt - state.groundAlt);
+  const altAGL = Math.round(sumAlt / sumDt - state.groundAlt);
 
   return {
     speed,
