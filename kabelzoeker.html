@@ -405,6 +405,10 @@ async function handleFile(file) {
 }
 
 function parseIGC(text) {
+  // Midnight UTC-wrap tracker: B-record tijd is alleen HHMMSS, dus vluchten
+  // over 00:00 UTC heen zouden Δt ≈ -86399s geven en alle climb-rates +
+  // window-detecties slopen. We tellen +86400 per day-wrap.
+  let lastT = -1, dayOffset = 0;
   const lines = text.split(/\r?\n/);
   state.fixes = [];
   state.date = null;
@@ -432,8 +436,13 @@ function parseIGC(text) {
       if (lonHem === 'W') lon = -lon;
       const pressAlt = parseInt(line.substr(25,5));
       const gpsAlt = parseInt(line.substr(30,5));
-      const alt = gpsAlt || pressAlt;
-      const t = hh*3600 + mi*60 + ss;
+      // gpsAlt=0 betekent meestal "GPS-fix nog niet locked", NIET hoogte 0.
+      // Met `|| ` zou een 0-waarde de pressure-alt overschrijven en mengt
+      // frames. Alleen GPS gebruiken als 'ie ook echt een waarde heeft.
+      const alt = (Number.isFinite(gpsAlt) && gpsAlt !== 0) ? gpsAlt : pressAlt;
+      let t = hh*3600 + mi*60 + ss + dayOffset;
+      if (t < lastT - 3600) { dayOffset += 86400; t += 86400; }
+      lastT = t;
       if (!isNaN(lat) && !isNaN(lon) && !isNaN(alt)) {
         state.fixes.push({ t, lat, lon, alt });
       }
@@ -474,6 +483,7 @@ function extractWindFromIGC() {
     const dy = (b.lat - a.lat) * 111320;
     const dx = (b.lon - a.lon) * 111320 * Math.cos(latMid);
     allSegs.push({
+      t: a.t,  // absolute tijd voor sliding-window logica op tijd i.p.v. count
       dt, dx, dy,
       hdg: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360,
       alt: (a.alt + b.alt) / 2,
@@ -495,16 +505,17 @@ function extractWindFromIGC() {
   function analyzeWindow(adjStart) {
     const startAlt = allSegs[adjStart].alt;
     let cumRot = 0, lastWholeIdx = -1, prevMult = 0, accT = 0;
-    let stillCount = 0;
+    let glideT = 0;
     for (let i = adjStart; i < allSegs.length; i++) {
       if (accT >= 180) break;
       if (allSegs[i].alt - startAlt > 150) break;
-      // Glide-detectie: 5+ opeenvolgende segments met <3° turn = uit thermal.
-      // Voorkomt dat window van thermal A → glide → thermal B spant.
+      // Glide-detectie op TIJD i.p.v. count: >5s aaneen met <3° turn = uit
+      // thermal. Tijd-gebaseerd zodat 4Hz-loggers niet voortijdig afkappen.
       if (Math.abs(allSegs[i].dh) < 3) {
-        if (++stillCount > 5) break;
+        glideT += allSegs[i].dt;
+        if (glideT > 5) break;
       } else {
-        stillCount = 0;
+        glideT = 0;
       }
       cumRot += allSegs[i].dh;
       const curMult = Math.trunc(cumRot / 360);
@@ -571,8 +582,13 @@ function extractWindFromIGC() {
     const result = analyzeWindow(adjStart);
     if (result) return result;
 
-    // Schuif voorbij dit circling-segment en probeer volgende
-    searchFrom = circStart + 30;
+    // Schuif voorbij dit circling-segment en probeer volgende.
+    // Op TIJD (30s) i.p.v. segment-count: bij 4Hz loggers is 30 segments
+    // maar 7.5s wat geldige segmenten zou overslaan en falsely combineren.
+    const tCurr = allSegs[circStart].t;
+    let nextIdx = circStart + 1;
+    while (nextIdx < allSegs.length && allSegs[nextIdx].t - tCurr < 30) nextIdx++;
+    searchFrom = nextIdx;
   }
   return null;
 }
@@ -602,20 +618,24 @@ function detectRelease() {
   }
 
   // Vind het MOMENT VAN STARTEN: eerste fix waar de glider duidelijk
-  // los is van de grond (alt > groundAlt + 20m). Voorheen werd het
-  // analyse-venster gemeten vanaf fixes[0].t — maar IGCs kunnen 60-300s+
-  // stationaire grond-fixes hebben vóór de start (bv. 497XZAP38: 211s
-  // stilstand vóór winch). Dat zette het 200s-venster vóór de echte
-  // launch en de algoritme miste 'm volledig.
+  // los is van de grond (alt > groundAlt + 20m), GESUSTAINED voor 3 fixes
+  // achter elkaar. De sustainment-check voorkomt dat één GPS-spike (kan
+  // 25m+ uitslaan voor 1 fix) launchIdx in een grond-stilstand-periode
+  // plaatst, wat t0 minuten vóór de echte launch zou zetten.
   let launchIdx = -1;
-  for (let i = 0; i < fixes.length; i++) {
-    if (fixes[i].alt - groundAlt > 20) { launchIdx = i; break; }
+  for (let i = 0; i < fixes.length - 2; i++) {
+    if (fixes[i].alt - groundAlt > 20
+        && fixes[i+1].alt - groundAlt > 20
+        && fixes[i+2].alt - groundAlt > 20) {
+      launchIdx = i; break;
+    }
   }
   if (launchIdx < 0) launchIdx = 0; // glider lijkt niet airborne — degenerate
   // Effectief t0 = ~5s vóór het airborne-moment (vangt het exacte launch-fix)
   const t0 = fixes[Math.max(0, launchIdx - 3)].t;
-  // Venster verlengd naar 400s om aerotow (5-10 min sleep) ook te dekken
-  const SEARCH_WINDOW = 400;
+  // Venster verlengd naar 600s om lange aerotows (Alpine sleep, zware
+  // tweezitter, zwakke sleper kunnen 10+ min duren) ook te dekken.
+  const SEARCH_WINDOW = 600;
   let peakIdx = -1, peakVal = -Infinity;
   for (let i = 0; i < fixes.length; i++) {
     if (fixes[i].t - t0 > SEARCH_WINDOW) break;
