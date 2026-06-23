@@ -191,7 +191,7 @@
     <div class="stats">
       <div class="stat"><div class="label">Loskoppelhoogte</div><div class="value" id="statAlt">— <span class="unit">m AGL</span></div></div>
       <div class="stat"><div class="label">Windsnelheid</div><div class="value" id="statWs">— <span class="unit">m/s @10m</span></div></div>
-      <div class="stat"><div class="label">Windrichting</div><div class="value" id="statWd">— <span class="unit">°</span></div></div>
+      <div class="stat"><div class="label">Wind uit</div><div class="value" id="statWd">— <span class="unit">°</span></div></div>
       <div class="stat"><div class="label">Valtijd</div><div class="value" id="statFall">— <span class="unit">s</span></div></div>
       <div class="stat"><div class="label">Drift</div><div class="value" id="statDrift">— <span class="unit">m</span></div></div>
       <div class="stat"><div class="label">Zoekgebied</div><div class="value" id="statRadius">— <span class="unit">m</span></div></div>
@@ -1060,7 +1060,12 @@ function recalculate(altAGL) {
 
   $('statAlt').innerHTML = Math.round(altAGL) + ' <span class="unit">m AGL</span>';
   $('statWs').innerHTML = state.windSpeed10.toFixed(1) + ' <span class="unit">m/s @10m</span>';
-  $('statWd').innerHTML = Math.round(state.windDir10) + ' <span class="unit">°</span>';
+  // FROM-conventie expliciet maken (zelfde als KNMI/Open-Meteo): wind komt UIT
+  // deze richting. Kompas-cardinal helpt om dat in één oogopslag te lezen.
+  const COMPASS = ['N','NNO','NO','ONO','O','OZO','ZO','ZZO','Z','ZZW','ZW','WZW','W','WNW','NW','NNW'];
+  const wdRound = Math.round(state.windDir10);
+  const wdCompass = COMPASS[Math.round(state.windDir10 / 22.5) % 16];
+  $('statWd').innerHTML = wdRound + '° <span class="unit">(uit ' + wdCompass + ')</span>';
   $('statFall').innerHTML = fallTime.toFixed(1) + ' <span class="unit">s</span>';
   $('statDrift').innerHTML = Math.round(driftDist) + ' <span class="unit">m</span>';
   $('statRadius').innerHTML = Math.round(semiAlong) + '×' + Math.round(semiCross) + ' <span class="unit">m</span>';
