@@ -1091,11 +1091,30 @@ function recalculate(altAGL) {
   // Worst-case combined ≈ 4× de gemiddelde drift, met minimum 200m als
   // ondergrens (voor heel-lage-wind situaties waar drift gewoon te klein is).
   const outerRadius = Math.max(200, driftDist * 4);
-  drawMap(fix, dest, ellipsePts, trajLL, outerRadius);
+
+  // Release-positie heeft directional uncertainty: de release-detectie
+  // pakt een fix die ~1-2s naast het werkelijke release-moment kan zitten;
+  // tijdens die tijd vliegt de glider 15-25 m/s, dus ~25-40m onzekerheid
+  // langs de vliegrichting. Cross-direction nauwelijks (~3m). Daarom ellips
+  // i.p.v. cirkel. Bereken vliegrichting uit fixes vlak vóór release.
+  const idxA = Math.max(0, state.releaseIdx - 3);
+  const idxB = state.releaseIdx;
+  const fa = state.fixes[idxA], fb = state.fixes[idxB];
+  const dt = Math.max(1, fb.t - fa.t);
+  const latMid = (fa.lat + fb.lat) / 2 * Math.PI / 180;
+  const dxR = (fb.lon - fa.lon) * 111320 * Math.cos(latMid);
+  const dyR = (fb.lat - fa.lat) * 111320;
+  const speedR = Math.sqrt(dxR * dxR + dyR * dyR) / dt;
+  const headingR = (Math.atan2(dxR, dyR) * 180 / Math.PI + 360) % 360;
+  const releaseSemiAlong = Math.max(15, Math.min(40, speedR * 1.5));
+  const releaseSemiCross = 5;
+  const releaseEllipsePts = buildEllipse(fix.lat, fix.lon, releaseSemiAlong, releaseSemiCross, headingR);
+
+  drawMap(fix, dest, ellipsePts, trajLL, outerRadius, releaseEllipsePts);
 }
 
 // ---------- Map rendering ----------
-function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius) {
+function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius, releaseEllipsePts) {
   if (!state.map) {
     state.map = L.map('map').setView([releaseFix.lat, releaseFix.lon], 15);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -1124,14 +1143,24 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius) {
     state.layers.push(trajLine);
   }
 
-  // Release marker (yellow)
-  const releaseIcon = L.divIcon({
+  // Release-ellips (geel): smal en lang langs de vliegrichting. Geeft
+  // de directional uncertainty in release-positie weer (~±25-40m langs
+  // vliegrichting door 1-2s detectie-onzekerheid × ~20 m/s glider-snelheid,
+  // <5m cross). Vervangt de oude vaste-dot-marker.
+  if (releaseEllipsePts && releaseEllipsePts.length > 1) {
+    const relEllipse = L.polygon(releaseEllipsePts, {
+      color: '#ffd54f', fillColor: '#ffd54f', fillOpacity: 0.45, weight: 2
+    }).bindPopup('Loskoppelpunt (±directional uncertainty)').addTo(state.map);
+    state.layers.push(relEllipse);
+  }
+  // Klein zwart center-dot voor exacte release-fix positie
+  const releaseDotIcon = L.divIcon({
     className: '',
-    html: '<div style="background:#ffd54f;width:18px;height:18px;border-radius:50%;border:3px solid #0f1419;box-shadow:0 0 0 2px #ffd54f;"></div>',
-    iconSize: [18,18], iconAnchor: [9,9]
+    html: '<div style="background:#0f1419;width:6px;height:6px;border-radius:50%;border:1.5px solid #ffd54f;"></div>',
+    iconSize: [6,6], iconAnchor: [3,3]
   });
-  const releaseMarker = L.marker([releaseFix.lat, releaseFix.lon], { icon: releaseIcon })
-    .bindPopup('Loskoppelpunt')
+  const releaseMarker = L.marker([releaseFix.lat, releaseFix.lon], { icon: releaseDotIcon })
+    .bindPopup('Gedetecteerd loskoppelpunt')
     .addTo(state.map);
   state.layers.push(releaseMarker);
 
@@ -1207,15 +1236,19 @@ function toggleLocation() {
           iconSize: [16,16], iconAnchor: [8,8]
         });
         state.userMarker = L.marker(latlng, { icon }).bindPopup('Jouw locatie').addTo(state.map);
+        // Klein 2m-cirkeltje rond locatie. GPS-accuracy kan 5-50m zijn maar
+        // dat geeft een onleesbaar dikke bubbel die met het spoor mengt.
+        // 2m is groot genoeg om je positie te markeren, klein genoeg om
+        // het spoor leesbaar te houden.
         state.userAccCircle = L.circle(latlng, {
-          radius: accuracy, color: '#2196f3', fillColor: '#2196f3',
-          fillOpacity: 0.1, weight: 1
+          radius: 2, color: '#2196f3', fillColor: '#2196f3',
+          fillOpacity: 0.3, weight: 1
         }).addTo(state.map);
         const group = L.featureGroup([state.userMarker, ...state.layers]);
         state.map.fitBounds(group.getBounds().pad(0.2));
       } else {
         state.userMarker.setLatLng(latlng);
-        state.userAccCircle.setLatLng(latlng).setRadius(accuracy);
+        state.userAccCircle.setLatLng(latlng);
       }
 
       // Voeg punt aan spoor toe als 'ie ≥5m van het laatste punt ligt
