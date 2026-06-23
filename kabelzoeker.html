@@ -729,9 +729,10 @@ async function fetchWind() {
     ? 'https://api.open-meteo.com/v1/forecast'
     : 'https://historical-forecast-api.open-meteo.com/v1/forecast';
   const models = [
-    { id: 'knmi_seamless', label: 'KNMI HARMONIE 2km' },
-    { id: 'icon_eu',       label: 'ICON-EU 6km' },
-    { id: 'ecmwf_ifs025',  label: 'ECMWF-IFS 25km' },
+    { id: 'knmi_seamless',            label: 'KNMI HARMONIE 2km' },
+    { id: 'meteofrance_arome_europe', label: 'AROME 1.3km' },
+    { id: 'icon_eu',                  label: 'ICON-EU 6km' },
+    { id: 'ecmwf_ifs025',             label: 'ECMWF-IFS 25km' },
   ];
   const fetchOne = (m) =>
     fetch(`${baseUrl}?${commonParams}&models=${m.id}`)
