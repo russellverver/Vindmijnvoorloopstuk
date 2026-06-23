@@ -206,6 +206,7 @@
       <input type="number" id="vzInput" min="10" max="45" step="1" value="28">
       <button id="recalcBtn">Herbereken</button>
       <button id="locateBtn" type="button">📍 Toon mijn locatie</button>
+      <button id="clearTrailBtn" type="button" style="background:#ffb74d; color:#0f1419">🧹 Wis spoor</button>
     </div>
 
     <details class="override">
@@ -345,6 +346,17 @@ $('clearManualBtn').addEventListener('click', () => {
   }
 });
 $('locateBtn').addEventListener('click', toggleLocation);
+
+// Wis-spoor knop: alleen de breadcrumb-trail wegen, locatie-tracking blijft
+// actief. Praktisch in het veld als je opnieuw begint te zoeken na een
+// rondje, zonder eerst de gehele tracking-modus uit te zetten.
+$('clearTrailBtn').addEventListener('click', () => {
+  if (state.userTrailLine) {
+    state.map.removeLayer(state.userTrailLine);
+    state.userTrailLine = null;
+  }
+  state.userTrailPoints = [];
+});
 
 // ---------- IGC parsing ----------
 async function handleFile(file) {
@@ -1071,11 +1083,19 @@ function recalculate(altAGL) {
   $('statRadius').innerHTML = Math.round(semiAlong) + '×' + Math.round(semiCross) + ' <span class="unit">m</span>';
   $('windSource').innerHTML = '<b>Wind bron:</b> ' + state.windSource;
 
-  drawMap(fix, dest, ellipsePts, trajLL);
+  // Outer-bound cirkel ("oranje"): "fysisch onmogelijk om hierbuiten te liggen".
+  // Generous bound die rekening houdt met max-realistische afwijkingen:
+  //  - wind tot 2× verkeerd voorspeld (model vs werkelijkheid)
+  //  - terminal velocity tot 1.5× verkeerd (28 vs ~18 m/s = 56% langere val)
+  //  - +30° wind-richting onzekerheid (lateral spread)
+  // Worst-case combined ≈ 4× de gemiddelde drift, met minimum 200m als
+  // ondergrens (voor heel-lage-wind situaties waar drift gewoon te klein is).
+  const outerRadius = Math.max(200, driftDist * 4);
+  drawMap(fix, dest, ellipsePts, trajLL, outerRadius);
 }
 
 // ---------- Map rendering ----------
-function drawMap(releaseFix, dest, ellipsePts, trajLL) {
+function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius) {
   if (!state.map) {
     state.map = L.map('map').setView([releaseFix.lat, releaseFix.lon], 15);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -1115,6 +1135,17 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL) {
     .addTo(state.map);
   state.layers.push(releaseMarker);
 
+  // Outer-bound cirkel (oranje): "fysisch onmogelijk om hierbuiten te liggen"-
+  // zone. Tekenen vóór de rode ellips zodat die er bovenop ligt.
+  if (outerRadius && outerRadius > 0) {
+    const outerBound = L.circle([dest.lat, dest.lon], {
+      radius: outerRadius,
+      color: '#ff9800', fillColor: '#ff9800',
+      fillOpacity: 0.08, weight: 2, dashArray: '6,5'
+    }).bindPopup('Buiten deze cirkel fysisch onmogelijk').addTo(state.map);
+    state.layers.push(outerBound);
+  }
+
   // Search ellipse (red)
   const ellipse = L.polygon(ellipsePts, {
     color: '#ef5350', fillColor: '#ef5350', fillOpacity: 0.22, weight: 2
@@ -1132,6 +1163,12 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL) {
 
   const bounds = L.latLngBounds([[releaseFix.lat, releaseFix.lon]]);
   for (const p of ellipsePts) bounds.extend(p);
+  // Outer-bound cirkel ook meenemen in initiële zoom
+  if (outerRadius && outerRadius > 0) {
+    const r = outerRadius / 111320; // m → graden (ruw)
+    bounds.extend([dest.lat + r, dest.lon + r / Math.cos(dest.lat * Math.PI / 180)]);
+    bounds.extend([dest.lat - r, dest.lon - r / Math.cos(dest.lat * Math.PI / 180)]);
+  }
   state.map.fitBounds(bounds.pad(0.3));
   setTimeout(() => state.map.invalidateSize(), 100);
 }
