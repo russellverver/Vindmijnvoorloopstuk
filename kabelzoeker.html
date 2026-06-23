@@ -1111,30 +1111,11 @@ function recalculate(altAGL) {
   // Worst-case combined ≈ 4× de gemiddelde drift, met minimum 200m als
   // ondergrens (voor heel-lage-wind situaties waar drift gewoon te klein is).
   const outerRadius = Math.max(200, driftDist * 4);
-
-  // Release-positie heeft directional uncertainty: de release-detectie
-  // pakt een fix die ~1-2s naast het werkelijke release-moment kan zitten;
-  // tijdens die tijd vliegt de glider 15-25 m/s, dus ~25-40m onzekerheid
-  // langs de vliegrichting. Cross-direction nauwelijks (~3m). Daarom ellips
-  // i.p.v. cirkel. Bereken vliegrichting uit fixes vlak vóór release.
-  const idxA = Math.max(0, state.releaseIdx - 3);
-  const idxB = state.releaseIdx;
-  const fa = state.fixes[idxA], fb = state.fixes[idxB];
-  const dt = Math.max(1, fb.t - fa.t);
-  const latMid = (fa.lat + fb.lat) / 2 * Math.PI / 180;
-  const dxR = (fb.lon - fa.lon) * 111320 * Math.cos(latMid);
-  const dyR = (fb.lat - fa.lat) * 111320;
-  const speedR = Math.sqrt(dxR * dxR + dyR * dyR) / dt;
-  const headingR = (Math.atan2(dxR, dyR) * 180 / Math.PI + 360) % 360;
-  const releaseSemiAlong = Math.max(15, Math.min(40, speedR * 1.5));
-  const releaseSemiCross = 5;
-  const releaseEllipsePts = buildEllipse(fix.lat, fix.lon, releaseSemiAlong, releaseSemiCross, headingR);
-
-  drawMap(fix, dest, ellipsePts, trajLL, outerRadius, releaseEllipsePts);
+  drawMap(fix, dest, ellipsePts, trajLL, outerRadius);
 }
 
 // ---------- Map rendering ----------
-function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius, releaseEllipsePts) {
+function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius) {
   if (!state.map) {
     state.map = L.map('map').setView([releaseFix.lat, releaseFix.lon], 15);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -1163,24 +1144,16 @@ function drawMap(releaseFix, dest, ellipsePts, trajLL, outerRadius, releaseEllip
     state.layers.push(trajLine);
   }
 
-  // Release-ellips (geel): smal en lang langs de vliegrichting. Geeft
-  // de directional uncertainty in release-positie weer (~±25-40m langs
-  // vliegrichting door 1-2s detectie-onzekerheid × ~20 m/s glider-snelheid,
-  // <5m cross). Vervangt de oude vaste-dot-marker.
-  if (releaseEllipsePts && releaseEllipsePts.length > 1) {
-    const relEllipse = L.polygon(releaseEllipsePts, {
-      color: '#ffd54f', fillColor: '#ffd54f', fillOpacity: 0.45, weight: 2
-    }).bindPopup('Loskoppelpunt (±directional uncertainty)').addTo(state.map);
-    state.layers.push(relEllipse);
-  }
-  // Klein zwart center-dot voor exacte release-fix positie
-  const releaseDotIcon = L.divIcon({
+  // Release-marker: 💥 emoji op het loskoppel-moment. Standaard Leaflet-
+  // marker = screen-fixed pixels, dus bij inzoomen wordt 'ie kleiner t.o.v.
+  // de grond → preciezere locatie zichtbaar bij hoge zoom.
+  const releaseIcon = L.divIcon({
     className: '',
-    html: '<div style="background:#0f1419;width:6px;height:6px;border-radius:50%;border:1.5px solid #ffd54f;"></div>',
-    iconSize: [6,6], iconAnchor: [3,3]
+    html: '<div style="font-size:28px;line-height:1;text-shadow:0 0 3px #0f1419;">💥</div>',
+    iconSize: [28,28], iconAnchor: [14,14]
   });
-  const releaseMarker = L.marker([releaseFix.lat, releaseFix.lon], { icon: releaseDotIcon })
-    .bindPopup('Gedetecteerd loskoppelpunt')
+  const releaseMarker = L.marker([releaseFix.lat, releaseFix.lon], { icon: releaseIcon })
+    .bindPopup('Loskoppelpunt')
     .addTo(state.map);
   state.layers.push(releaseMarker);
 
