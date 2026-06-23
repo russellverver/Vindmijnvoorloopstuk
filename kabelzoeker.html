@@ -279,7 +279,12 @@ const state = {
   layers: [],
   watchId: null,
   userMarker: null,
-  userAccCircle: null
+  userAccCircle: null,
+  // Spoor / breadcrumb-trail: lat/lon-punten waar je bent geweest sinds
+  // "Toon mijn locatie" werd aangezet. Helpt je zien welk gebied je al hebt
+  // afgelopen tijdens het zoeken. Wordt gewist als je locatie-tracking stopt.
+  userTrailPoints: [],
+  userTrailLine: null,
 };
 
 const $ = id => document.getElementById(id);
@@ -1044,6 +1049,8 @@ function toggleLocation() {
     state.watchId = null;
     if (state.userMarker) { state.map.removeLayer(state.userMarker); state.userMarker = null; }
     if (state.userAccCircle) { state.map.removeLayer(state.userAccCircle); state.userAccCircle = null; }
+    if (state.userTrailLine) { state.map.removeLayer(state.userTrailLine); state.userTrailLine = null; }
+    state.userTrailPoints = [];
     btn.classList.remove('active');
     btn.textContent = '📍 Toon mijn locatie';
     return;
@@ -1078,6 +1085,27 @@ function toggleLocation() {
         state.userMarker.setLatLng(latlng);
         state.userAccCircle.setLatLng(latlng).setRadius(accuracy);
       }
+
+      // Voeg punt aan spoor toe als 'ie ≥5m van het laatste punt ligt
+      // (filtert GPS-jitter bij stilstaan eruit).
+      const last = state.userTrailPoints[state.userTrailPoints.length - 1];
+      let addPt = !last;
+      if (last) {
+        const dy = (latitude - last[0]) * 111320;
+        const dx = (longitude - last[1]) * 111320 * Math.cos(latitude * Math.PI / 180);
+        if (Math.sqrt(dx * dx + dy * dy) > 5) addPt = true;
+      }
+      if (addPt) {
+        state.userTrailPoints.push(latlng);
+        if (!state.userTrailLine) {
+          state.userTrailLine = L.polyline(state.userTrailPoints, {
+            color: '#2196f3', weight: 4, opacity: 0.7, lineJoin: 'round'
+          }).addTo(state.map);
+        } else {
+          state.userTrailLine.setLatLngs(state.userTrailPoints);
+        }
+      }
+
       btn.classList.add('active');
       btn.textContent = '📍 Stop locatie';
     },
