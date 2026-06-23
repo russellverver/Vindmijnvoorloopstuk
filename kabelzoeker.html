@@ -817,41 +817,26 @@ function windAt(altAGL) {
 }
 
 // Initial horizontal velocity of voorloopstuk at release (glider forward speed)
-function initialVelocity() {
-  const i = state.releaseIdx;
-  const a = state.fixes[Math.max(0, i - 3)];
-  const b = state.fixes[Math.min(state.fixes.length - 1, i + 1)];
-  const dt = b.t - a.t;
-  if (dt <= 0) return { vx: 0, vy: 0 };
-  const latMid = (a.lat + b.lat) / 2 * Math.PI / 180;
-  const dy = (b.lat - a.lat) * 111320;
-  const dx = (b.lon - a.lon) * 111320 * Math.cos(latMid);
-  return { vx: dx / dt, vy: dy / dt };
-}
-
-// Glider climb rate at release — voorloopstuk inherits this upward velocity
-function initialClimbRate() {
-  const i = state.releaseIdx;
-  const a = state.fixes[Math.max(0, i - 3)];
-  const b = state.fixes[Math.min(state.fixes.length - 1, i)];
-  const dt = b.t - a.t;
-  if (dt <= 0) return 0;
-  return (b.alt - a.alt) / dt;
-}
-
 // 3D-coupled quadratic drag simulation.
 // F_drag = -½·ρ·Cd·A·|v_rel|·v_rel  →  a_drag = -(g/vt²)·|v_rel|·v_rel
 // Gravity acts on z-axis only. Wind shear scales horizontal air velocity with altitude.
 // Coordinates: x=east, y=north, z=down (positive vz = falling).
+//
+// LIERSTART-FYSICA (2026-06-23): vóór release was het voorloopstuk gekoppeld
+// aan de glider, dus deelde 't zijn snelheid. MAAR de kabel hangt er nog aan
+// vast richting de lier — zodra de glider loslaat compenseert de kabel-spanning
+// die geërfde snelheid binnen een fractie. Effectief: het voorloopstuk start
+// met nagenoeg NUL horizontale en verticale snelheid, drijft daarna puur door
+// wind tijdens de val. (Empirisch bevestigd met testvlucht 66KXZAP3: gevonden
+// NE van release = wind-only drift. De vorige aanname "voorloopstuk erft
+// glider-vector" voorspelde drift naar SW = tegenovergesteld.)
 function simulateTrajectory(altAGL) {
-  const v0 = initialVelocity();
-  const climb0 = initialClimbRate();
   const vt = state.descentSpeed;
   const k = GRAVITY / (vt * vt);
 
   let x = 0, y = 0, h = altAGL;
-  let vx = v0.vx, vy = v0.vy;
-  let vz = -climb0; // negative if glider still climbing
+  let vx = 0, vy = 0;
+  let vz = 0;
   const points = [{ x, y, h }];
   let t = 0;
 
