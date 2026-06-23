@@ -589,25 +589,52 @@ function detectRelease() {
     climb.push(dt > 0 ? dh/dt : 0);
   }
 
-  const t0 = fixes[0].t;
+  // Vind het MOMENT VAN STARTEN: eerste fix waar de glider duidelijk
+  // los is van de grond (alt > groundAlt + 20m). Voorheen werd het
+  // analyse-venster gemeten vanaf fixes[0].t — maar IGCs kunnen 60-300s+
+  // stationaire grond-fixes hebben vóór de start (bv. 497XZAP38: 211s
+  // stilstand vóór winch). Dat zette het 200s-venster vóór de echte
+  // launch en de algoritme miste 'm volledig.
+  let launchIdx = -1;
+  for (let i = 0; i < fixes.length; i++) {
+    if (fixes[i].alt - groundAlt > 20) { launchIdx = i; break; }
+  }
+  if (launchIdx < 0) launchIdx = 0; // glider lijkt niet airborne — degenerate
+  // Effectief t0 = ~5s vóór het airborne-moment (vangt het exacte launch-fix)
+  const t0 = fixes[Math.max(0, launchIdx - 3)].t;
+  // Venster verlengd naar 400s om aerotow (5-10 min sleep) ook te dekken
+  const SEARCH_WINDOW = 400;
   let peakIdx = -1, peakVal = -Infinity;
   for (let i = 0; i < fixes.length; i++) {
-    if (fixes[i].t - t0 > 200) break;
+    if (fixes[i].t - t0 > SEARCH_WINDOW) break;
+    if (fixes[i].t < t0) continue;
     if (climb[i] > peakVal) { peakVal = climb[i]; peakIdx = i; }
   }
   if (peakIdx < 0 || peakVal < 2) {
-    // Fallback: highest point within 200s
-    let hiIdx = 0, hiAlt = -Infinity;
+    // Fallback: highest point binnen het venster
+    let hiIdx = launchIdx, hiAlt = -Infinity;
     for (let i = 0; i < fixes.length; i++) {
-      if (fixes[i].t - t0 > 200) break;
+      if (fixes[i].t - t0 > SEARCH_WINDOW) break;
+      if (fixes[i].t < t0) continue;
       if (fixes[i].alt > hiAlt) { hiAlt = fixes[i].alt; hiIdx = i; }
     }
     state.releaseIdx = hiIdx;
     return;
   }
+  // Vanaf peak vooruit: eerste fix waar climb < 1.5 m/s SUSTAINED voor ≥3s,
+  // i.p.v. één losse turbulence-dip. Voorkomt false positives bij bumpy climb.
   for (let i = peakIdx; i < fixes.length; i++) {
-    if (fixes[i].t - t0 > 200) break;
-    if (climb[i] < 1.5) { state.releaseIdx = i; return; }
+    if (fixes[i].t - t0 > SEARCH_WINDOW) break;
+    if (climb[i] < 1.5) {
+      // Check sustainment: vereis dat ook de volgende ~3s onder 1.5 blijven
+      let sustained = true;
+      const tCheck = fixes[i].t;
+      for (let j = i; j < fixes.length; j++) {
+        if (fixes[j].t - tCheck > 3) break;
+        if (climb[j] >= 1.5) { sustained = false; break; }
+      }
+      if (sustained) { state.releaseIdx = i; return; }
+    }
   }
   state.releaseIdx = peakIdx;
 }
