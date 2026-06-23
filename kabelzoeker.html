@@ -465,6 +465,7 @@ function extractWindFromIGC() {
       dt, dx, dy,
       hdg: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360,
       alt: (a.alt + b.alt) / 2,
+      dAlt: (b.alt - a.alt) / dt,  // climb-rate per segment voor latere check
     });
   }
   if (allSegs.length < 30) return null;
@@ -503,10 +504,15 @@ function extractWindFromIGC() {
   }
   if (adjStart >= allSegs.length - 20) return null;
 
-  // Integer-cirkels window, max 180s
+  // Integer-cirkels window, max 180s EN max +150m hoogtewinst.
+  // Hoogte-cap voorkomt dat we wind middelen over meerdere windlagen — bij
+  // sterke thermal kun je in 180s zo 300m+ klimmen, en wind draait reëel met
+  // hoogte (zie analyse 54RXZAP21: van 290° op 350m naar 50° op 750m).
+  const startAlt = allSegs[adjStart].alt;
   let cumRot = 0, lastWholeIdx = -1, prevMult = 0, accT = 0;
   for (let i = adjStart; i < allSegs.length; i++) {
     if (accT >= 180) break;
+    if (allSegs[i].alt - startAlt > 150) break;
     cumRot += allSegs[i].dh;
     const curMult = Math.trunc(cumRot / 360);
     if (curMult !== prevMult) {
@@ -518,15 +524,22 @@ function extractWindFromIGC() {
   if (lastWholeIdx < 0) return null;
 
   const segs = allSegs.slice(adjStart, lastWholeIdx + 1);
-  let totalRotation = 0, sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0;
+  let totalRotation = 0, sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0, sumClimb = 0;
   for (const s of segs) {
     totalRotation += s.dh;
     sumDx += s.dx;
     sumDy += s.dy;
     sumDt += s.dt;
     sumAlt += s.alt * s.dt;
+    sumClimb += s.dAlt * s.dt;
   }
-  if (Math.abs(totalRotation) < 720) return null;
+  // Minimum 3 volle cirkels (1080°): met 2 cirkels staat de mean nog te veel
+  // onder invloed van bank-asymmetrie en partial-circle quirks.
+  if (Math.abs(totalRotation) < 1080) return null;
+  // Climb-check: sluit dalende spiralen / glides-met-bocht uit — die geven
+  // een "wind" die in werkelijkheid glide-drift is (kan tot 20+ m/s artefact).
+  const meanClimb = sumClimb / sumDt;
+  if (meanClimb < 0.3) return null;
 
   const meanU_to = sumDx / sumDt;
   const meanV_to = sumDy / sumDt;
