@@ -477,85 +477,92 @@ function extractWindFromIGC() {
   }
   allSegs[0].dh = 0;
 
-  // Detecteer start van tight circling
-  let circStart = -1;
-  for (let i = 0; i < allSegs.length; i++) {
-    let cumDh = 0, cumDt = 0, sumDx = 0, sumDy = 0, j = i;
-    while (j < allSegs.length && cumDt < 60) {
-      cumDh += allSegs[j].dh;
-      cumDt += allSegs[j].dt;
-      sumDx += allSegs[j].dx;
-      sumDy += allSegs[j].dy;
-      j++;
+  // Probeer meerdere circling-segmenten als de eerste niet aan de filters
+  // voldoet (kan een uitloop direct na release zijn, of een dalende spiraal).
+  // Helper analyseert één window vanaf adjStart; returnt null bij faal.
+  function analyzeWindow(adjStart) {
+    const startAlt = allSegs[adjStart].alt;
+    let cumRot = 0, lastWholeIdx = -1, prevMult = 0, accT = 0;
+    let stillCount = 0;
+    for (let i = adjStart; i < allSegs.length; i++) {
+      if (accT >= 180) break;
+      if (allSegs[i].alt - startAlt > 150) break;
+      // Glide-detectie: 5+ opeenvolgende segments met <3° turn = uit thermal.
+      // Voorkomt dat window van thermal A → glide → thermal B spant.
+      if (Math.abs(allSegs[i].dh) < 3) {
+        if (++stillCount > 5) break;
+      } else {
+        stillCount = 0;
+      }
+      cumRot += allSegs[i].dh;
+      const curMult = Math.trunc(cumRot / 360);
+      if (curMult !== prevMult) { lastWholeIdx = i; prevMult = curMult; }
+      accT += allSegs[i].dt;
     }
-    if (cumDt < 50) continue;
-    if (Math.abs(cumDh) > 360 && Math.sqrt(sumDx * sumDx + sumDy * sumDy) < 200) {
-      circStart = i;
-      break;
+    if (lastWholeIdx < 0) return null;
+
+    const segs = allSegs.slice(adjStart, lastWholeIdx + 1);
+    let totalRotation = 0, sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0, sumClimb = 0;
+    for (const s of segs) {
+      totalRotation += s.dh;
+      sumDx += s.dx; sumDy += s.dy; sumDt += s.dt;
+      sumAlt += s.alt * s.dt;
+      sumClimb += s.dAlt * s.dt;
     }
-  }
-  if (circStart < 0) return null;
+    if (Math.abs(totalRotation) < 1080) return null;
+    // Climb >= 0: sluit dalende spiralen uit (geven 20+ m/s wind-artefacten),
+    // maar laat zwakke thermals (+0.1 m/s) door — die geven valide wind-data.
+    const meanClimb = sumClimb / sumDt;
+    if (meanClimb < 0) return null;
 
-  // Skip 30s settling
-  let adjStart = circStart, tSkip = 0;
-  while (adjStart < allSegs.length && tSkip < 30) {
-    tSkip += allSegs[adjStart].dt;
-    adjStart++;
-  }
-  if (adjStart >= allSegs.length - 20) return null;
+    const meanU_to = sumDx / sumDt;
+    const meanV_to = sumDy / sumDt;
+    const speed = Math.sqrt(meanU_to * meanU_to + meanV_to * meanV_to);
+    if (speed > 15) return null;
+    const toDir = (Math.atan2(meanU_to, meanV_to) * 180 / Math.PI + 360) % 360;
+    const fromDir = (toDir + 180) % 360;
+    const altAGL = Math.round(sumAlt / sumDt - state.groundAlt);
 
-  // Integer-cirkels window, max 180s EN max +150m hoogtewinst.
-  // Hoogte-cap voorkomt dat we wind middelen over meerdere windlagen — bij
-  // sterke thermal kun je in 180s zo 300m+ klimmen, en wind draait reëel met
-  // hoogte (zie analyse 54RXZAP21: van 290° op 350m naar 50° op 750m).
-  const startAlt = allSegs[adjStart].alt;
-  let cumRot = 0, lastWholeIdx = -1, prevMult = 0, accT = 0;
-  for (let i = adjStart; i < allSegs.length; i++) {
-    if (accT >= 180) break;
-    if (allSegs[i].alt - startAlt > 150) break;
-    cumRot += allSegs[i].dh;
-    const curMult = Math.trunc(cumRot / 360);
-    if (curMult !== prevMult) {
-      lastWholeIdx = i;
-      prevMult = curMult;
+    return {
+      speed, dir: fromDir, altAGL,
+      rotation: Math.round(Math.abs(totalRotation)),
+      durationS: Math.round(sumDt),
+      meanClimb: meanClimb,
+    };
+  }
+
+  // Hoofdzoek: vind eerste tight-circling-segment, probeer analyse; bij faal
+  // schuif door naar volgend tight-circling-segment. Stopt bij eerste succes
+  // of geen meer segments.
+  let searchFrom = 0;
+  while (searchFrom < allSegs.length - 30) {
+    let circStart = -1;
+    for (let i = searchFrom; i < allSegs.length; i++) {
+      let cumDh = 0, cumDt = 0, sumDx = 0, sumDy = 0, j = i;
+      while (j < allSegs.length && cumDt < 60) {
+        cumDh += allSegs[j].dh; cumDt += allSegs[j].dt;
+        sumDx += allSegs[j].dx; sumDy += allSegs[j].dy; j++;
+      }
+      if (cumDt < 50) continue;
+      if (Math.abs(cumDh) > 360 && Math.sqrt(sumDx * sumDx + sumDy * sumDy) < 200) {
+        circStart = i; break;
+      }
     }
-    accT += allSegs[i].dt;
+    if (circStart < 0) return null;
+
+    let adjStart = circStart, tSkip = 0;
+    while (adjStart < allSegs.length && tSkip < 30) {
+      tSkip += allSegs[adjStart].dt; adjStart++;
+    }
+    if (adjStart >= allSegs.length - 20) return null;
+
+    const result = analyzeWindow(adjStart);
+    if (result) return result;
+
+    // Schuif voorbij dit circling-segment en probeer volgende
+    searchFrom = circStart + 30;
   }
-  if (lastWholeIdx < 0) return null;
-
-  const segs = allSegs.slice(adjStart, lastWholeIdx + 1);
-  let totalRotation = 0, sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0, sumClimb = 0;
-  for (const s of segs) {
-    totalRotation += s.dh;
-    sumDx += s.dx;
-    sumDy += s.dy;
-    sumDt += s.dt;
-    sumAlt += s.alt * s.dt;
-    sumClimb += s.dAlt * s.dt;
-  }
-  // Minimum 3 volle cirkels (1080°): met 2 cirkels staat de mean nog te veel
-  // onder invloed van bank-asymmetrie en partial-circle quirks.
-  if (Math.abs(totalRotation) < 1080) return null;
-  // Climb-check: sluit dalende spiralen / glides-met-bocht uit — die geven
-  // een "wind" die in werkelijkheid glide-drift is (kan tot 20+ m/s artefact).
-  const meanClimb = sumClimb / sumDt;
-  if (meanClimb < 0.3) return null;
-
-  const meanU_to = sumDx / sumDt;
-  const meanV_to = sumDy / sumDt;
-  const speed = Math.sqrt(meanU_to * meanU_to + meanV_to * meanV_to);
-  if (speed > 15) return null;
-  const toDir = (Math.atan2(meanU_to, meanV_to) * 180 / Math.PI + 360) % 360;
-  const fromDir = (toDir + 180) % 360;
-  const altAGL = Math.round(sumAlt / sumDt - state.groundAlt);
-
-  return {
-    speed,
-    dir: fromDir,
-    altAGL,
-    rotation: Math.round(Math.abs(totalRotation)),
-    durationS: Math.round(sumDt),
-  };
+  return null;
 }
 
 function detectRelease() {
