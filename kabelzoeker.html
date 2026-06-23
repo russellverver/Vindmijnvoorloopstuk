@@ -685,35 +685,46 @@ async function fetchWind() {
   // verschoof de voorspelde landingsplek tientallen meters.
   const commonParams = `latitude=${lat}&longitude=${lon}&hourly=windspeed_10m,winddirection_10m,windspeed_100m,winddirection_100m&wind_speed_unit=ms&start_date=${d}&end_date=${d}&timezone=UTC`;
 
-  const attempts = [];
-  if (daysAgo < 0 || daysAgo < 7) {
-    attempts.push({
-      url: `https://api.open-meteo.com/v1/forecast?${commonParams}&models=knmi_seamless`,
-      source: 'KNMI HARMONIE (2.5km, forecast)'
-    });
-  }
-  attempts.push({
-    url: `https://historical-forecast-api.open-meteo.com/v1/forecast?${commonParams}&models=knmi_seamless`,
-    source: 'KNMI HARMONIE (2.5km, historical)'
-  });
-  attempts.push({
-    url: `https://archive-api.open-meteo.com/v1/archive?${commonParams}`,
-    source: 'ERA5 reanalyse (25km)'
-  });
+  // Multi-model parallel fetch via Open-Meteo. Drie EU-modellen tegelijk:
+  //   - KNMI HARMONIE 2km (NL-specifiek, hoogste resolutie)
+  //   - ICON-EU 6km (DWD)
+  //   - ECMWF-IFS 25km (globaal "gold standard")
+  // Bij overeenstemming = hoge confidence; bij divergentie = waarschuwing zichtbaar.
+  // Endpoint-keuze afhankelijk van leeftijd vlucht.
+  const baseUrl = (daysAgo < 0 || daysAgo < 7)
+    ? 'https://api.open-meteo.com/v1/forecast'
+    : 'https://historical-forecast-api.open-meteo.com/v1/forecast';
+  const models = [
+    { id: 'knmi_seamless', label: 'KNMI HARMONIE 2km' },
+    { id: 'icon_eu',       label: 'ICON-EU 6km' },
+    { id: 'ecmwf_ifs025',  label: 'ECMWF-IFS 25km' },
+  ];
+  const fetchOne = (m) =>
+    fetch(`${baseUrl}?${commonParams}&models=${m.id}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(j => (j?.hourly?.windspeed_10m?.[0] != null) ? { ...m, data: j } : null)
+      .catch(() => null);
+  let modelResults = (await Promise.all(models.map(fetchOne))).filter(Boolean);
 
+  // Fallback naar ERA5 archive als ALLE 3 forecast-modellen falen (oude vluchten)
   let data = null, usedSource = '';
-  for (const a of attempts) {
+  if (modelResults.length === 0) {
     try {
-      const res = await fetch(a.url);
-      if (!res.ok) continue;
-      const j = await res.json();
-      if (j.hourly && j.hourly.time && j.hourly.time.length > 0
-          && j.hourly.windspeed_10m && j.hourly.windspeed_10m[0] != null) {
-        data = j;
-        usedSource = a.source;
-        break;
+      const r = await fetch(`https://archive-api.open-meteo.com/v1/archive?${commonParams}`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j?.hourly?.windspeed_10m?.[0] != null) {
+          data = j;
+          usedSource = 'ERA5 reanalyse (25km, archive)';
+        }
       }
-    } catch (e) { /* try next */ }
+    } catch (e) { /* fall through */ }
+  } else {
+    // Gebruik het hoogste-resolutie model als primair (KNMI HARMONIE) als 'ie er
+    // is, anders het eerste beschikbare. Andere modellen tonen we ter vergelijking.
+    const primary = modelResults.find(m => m.id === 'knmi_seamless') || modelResults[0];
+    data = primary.data;
+    usedSource = primary.label;
   }
   // Als Open-Meteo niets gaf maar KNMI wél: gebruik KNMI alleen (geen 100m,
   // dus windAt valt terug op power-law). Alleen als ALLES faalt geven we op.
@@ -781,6 +792,37 @@ async function fetchWind() {
   state.modelWindSpeed100 = w100 ? w100.speed : null;
   state.modelWindDir100 = w100 ? w100.dir : null;
   state.modelWindSource = `${usedSource} (${heightsTag}) op ${d} ${hh}:${mm}Z (geïnterpoleerd)`;
+
+  // Multi-model cross-check: als we 2+ modellen hadden, toon ze allemaal en
+  // bereken divergentie. Gebruiker ziet direct of modellen het eens zijn.
+  if (modelResults && modelResults.length > 1) {
+    const modelDirs = [];
+    for (const m of modelResults) {
+      const mws = m.data.hourly.windspeed_100m || m.data.hourly.windspeed_10m;
+      const mwd = m.data.hourly.winddirection_100m || m.data.hourly.winddirection_10m;
+      const mw = interpWind(mws, mwd);
+      if (mw) modelDirs.push({ label: m.label, dir: mw.dir, speed: mw.speed });
+    }
+    if (modelDirs.length > 1) {
+      // Max circulaire spread tussen alle modellen (richtings-divergentie)
+      let maxSpread = 0;
+      for (let i = 0; i < modelDirs.length; i++) {
+        for (let j = i + 1; j < modelDirs.length; j++) {
+          let diff = Math.abs(modelDirs[i].dir - modelDirs[j].dir);
+          if (diff > 180) diff = 360 - diff;
+          if (diff > maxSpread) maxSpread = diff;
+        }
+      }
+      const comparisonStr = modelDirs.map(m =>
+        `${m.label.split(' ')[0]}: ${Math.round(m.dir)}° @ ${m.speed.toFixed(1)}m/s`
+      ).join(' | ');
+      const tag = maxSpread > 30
+        ? ` ⚠ MODELLEN ONEENS (Δ${Math.round(maxSpread)}°): ${comparisonStr}`
+        : ` ✓ modellen overeen (Δ${Math.round(maxSpread)}°): ${comparisonStr}`;
+      state.modelWindSource += tag;
+    }
+  }
+
   state.windSpeed10 = w10.speed;
   state.windDir10 = w10.dir;
   state.windSpeed100 = state.modelWindSpeed100;
