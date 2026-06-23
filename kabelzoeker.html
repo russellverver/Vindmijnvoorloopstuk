@@ -260,9 +260,13 @@ const state = {
   groundAlt: 0,
   windSpeed10: null,
   windDir10: null,
+  windSpeed100: null,        // upper-level wind voor richtings-draaiing met hoogte
+  windDir100: null,
   windSource: '',
   modelWindSpeed: null,  // keeps model value so "reset" restores it
   modelWindDir: null,
+  modelWindSpeed100: null,   // 100m model-waarden zodat "reset" ook die herstelt
+  modelWindDir100: null,
   modelWindSource: '',
   descentSpeed: 28,
   map: null,
@@ -308,6 +312,10 @@ $('applyManualBtn').addEventListener('click', () => {
   }
   state.windSpeed10 = ws;
   state.windDir10 = ((wd % 360) + 360) % 360;
+  // Handmatige override geldt voor surface; geen 100m-info → val terug op
+  // power-law i.p.v. een mix van gebruiker-input + (oude) model-100m.
+  state.windSpeed100 = null;
+  state.windDir100 = null;
   state.windSource = `Handmatig: ${ws.toFixed(1)} m/s uit ${Math.round(state.windDir10)}°`;
   const altAGL = parseFloat($('altInput').value);
   if (!isNaN(altAGL)) recalculate(altAGL);
@@ -316,6 +324,8 @@ $('clearManualBtn').addEventListener('click', () => {
   if (state.modelWindSpeed != null) {
     state.windSpeed10 = state.modelWindSpeed;
     state.windDir10 = state.modelWindDir;
+    state.windSpeed100 = state.modelWindSpeed100;
+    state.windDir100 = state.modelWindDir100;
     state.windSource = state.modelWindSource;
     $('manWs').value = '';
     $('manWd').value = '';
@@ -493,19 +503,13 @@ async function fetchWind() {
   const fix = state.fixes[state.releaseIdx];
   const flightHourFrac = fix.t / 3600;
 
-  // FIRST try real measured data from KNMI AWS station via nginx proxy
+  // Eerst proberen: KNMI AWS station (gemeten surface, 10m) via nginx proxy.
+  // We returnen NIET meteen — we hebben óók Open-Meteo nodig voor de 100m wind
+  // (richtings-shear). Aan het eind overschrijven we 10m met de KNMI-meting als
+  // die succesvol was.
   const knmi = await fetchKNMIStation(flightHourFrac);
-  if (knmi) {
-    state.modelWindSpeed = knmi.speed;
-    state.modelWindDir = knmi.dir;
-    state.modelWindSource = knmi.source;
-    state.windSpeed10 = knmi.speed;
-    state.windDir10 = knmi.dir;
-    state.windSource = knmi.source;
-    return;
-  }
 
-  // Fall back to Open-Meteo (KNMI HARMONIE model, then ERA5)
+  // Open-Meteo (KNMI HARMONIE model, then ERA5) — geeft zowel 10m als 100m
   const flightDate = new Date(state.date);
   const now = new Date();
   const daysAgo = (now - flightDate) / (1000 * 60 * 60 * 24);
@@ -517,7 +521,11 @@ async function fetchWind() {
   const lat = fix.lat.toFixed(4);
   const lon = fix.lon.toFixed(4);
   const d = state.date;
-  const commonParams = `latitude=${lat}&longitude=${lon}&hourly=windspeed_10m,winddirection_10m&wind_speed_unit=ms&start_date=${d}&end_date=${d}&timezone=UTC`;
+  // Vraag óók wind op 100m om de richtings-draaiing met hoogte mee te nemen
+  // (Ekman-spiraal). Vroeger werd alleen 10m gebruikt + 1/7 power-law, wat de
+  // wind-richting constant aanneemt — dat is in een ochtend-grenslaag fout en
+  // verschoof de voorspelde landingsplek tientallen meters.
+  const commonParams = `latitude=${lat}&longitude=${lon}&hourly=windspeed_10m,winddirection_10m,windspeed_100m,winddirection_100m&wind_speed_unit=ms&start_date=${d}&end_date=${d}&timezone=UTC`;
 
   const attempts = [];
   if (daysAgo < 0 || daysAgo < 7) {
@@ -549,11 +557,30 @@ async function fetchWind() {
       }
     } catch (e) { /* try next */ }
   }
-  if (!data) throw new Error('Geen winddata beschikbaar voor deze datum/locatie.');
+  // Als Open-Meteo niets gaf maar KNMI wél: gebruik KNMI alleen (geen 100m,
+  // dus windAt valt terug op power-law). Alleen als ALLES faalt geven we op.
+  if (!data) {
+    if (knmi) {
+      state.modelWindSpeed = knmi.speed;
+      state.modelWindDir = knmi.dir;
+      state.modelWindSpeed100 = null;
+      state.modelWindDir100 = null;
+      state.modelWindSource = knmi.source;
+      state.windSpeed10 = knmi.speed;
+      state.windDir10 = knmi.dir;
+      state.windSpeed100 = null;
+      state.windDir100 = null;
+      state.windSource = state.modelWindSource;
+      return;
+    }
+    throw new Error('Geen winddata beschikbaar voor deze datum/locatie.');
+  }
 
   const times = data.hourly.time;
   const ws = data.hourly.windspeed_10m;
   const wd = data.hourly.winddirection_10m;
+  const ws100 = data.hourly.windspeed_100m || null;
+  const wd100 = data.hourly.winddirection_100m || null;
 
   // Flight time in UTC (IGC is always UTC; we requested timezone=UTC from API)
   // Linearly interpolate between the two hours surrounding the flight time
@@ -567,32 +594,90 @@ async function fetchWind() {
   const idx1 = Math.min(idx0 + 1, times.length - 1);
   const frac = flightHourFrac - Math.floor(flightHourFrac); // 0..1
 
-  // Interpolate wind speed linearly, direction via vector components
-  // (avoids 359°/1° wrap-around averaging errors)
-  const ws0 = ws[idx0], ws1 = ws[idx1];
-  const wd0 = wd[idx0] * Math.PI / 180;
-  const wd1 = wd[idx1] * Math.PI / 180;
-  const u0 = ws0 * Math.sin(wd0), v0 = ws0 * Math.cos(wd0);
-  const u1 = ws1 * Math.sin(wd1), v1 = ws1 * Math.cos(wd1);
-  const uI = u0 + (u1 - u0) * frac;
-  const vI = v0 + (v1 - v0) * frac;
-  const speed = Math.sqrt(uI * uI + vI * vI);
-  const dir = (Math.atan2(uI, vI) * 180 / Math.PI + 360) % 360;
+  // Hulpfunctie: interpoleer wind tussen twee tijdstippen via u/v componenten
+  // (voorkomt 359°/1° wrap-around-fouten bij richting).
+  function interpWind(speedArr, dirArr) {
+    if (!speedArr || speedArr[idx0] == null) return null;
+    const s0 = speedArr[idx0], s1 = speedArr[idx1] != null ? speedArr[idx1] : s0;
+    const d0 = dirArr[idx0] * Math.PI / 180;
+    const d1 = (dirArr[idx1] != null ? dirArr[idx1] : dirArr[idx0]) * Math.PI / 180;
+    const u0 = s0 * Math.sin(d0), v0 = s0 * Math.cos(d0);
+    const u1 = s1 * Math.sin(d1), v1 = s1 * Math.cos(d1);
+    const uI = u0 + (u1 - u0) * frac;
+    const vI = v0 + (v1 - v0) * frac;
+    return {
+      speed: Math.sqrt(uI * uI + vI * vI),
+      dir: (Math.atan2(uI, vI) * 180 / Math.PI + 360) % 360,
+    };
+  }
+
+  const w10 = interpWind(ws, wd);
+  const w100 = interpWind(ws100, wd100);
+  if (!w10) throw new Error('Geen 10m winddata in API-respons.');
 
   const hh = String(Math.floor(flightHourFrac)).padStart(2,'0');
   const mm = String(Math.floor((flightHourFrac % 1) * 60)).padStart(2,'0');
-  state.modelWindSpeed = speed;
-  state.modelWindDir = dir;
-  state.modelWindSource = `${usedSource} op ${d} ${hh}:${mm}Z (geïnterpoleerd)`;
-  state.windSpeed10 = speed;
-  state.windDir10 = dir;
+  const heightsTag = w100 ? '10m+100m' : '10m';
+  state.modelWindSpeed = w10.speed;
+  state.modelWindDir = w10.dir;
+  state.modelWindSpeed100 = w100 ? w100.speed : null;
+  state.modelWindDir100 = w100 ? w100.dir : null;
+  state.modelWindSource = `${usedSource} (${heightsTag}) op ${d} ${hh}:${mm}Z (geïnterpoleerd)`;
+  state.windSpeed10 = w10.speed;
+  state.windDir10 = w10.dir;
+  state.windSpeed100 = state.modelWindSpeed100;
+  state.windDir100 = state.modelWindDir100;
   state.windSource = state.modelWindSource;
+
+  // Als KNMI station 290 succesvol een gemeten surface wind gaf: overrule de
+  // 10m model-waarden — meten is altijd beter dan modelleren bij de grond.
+  // 100m blijft van Open-Meteo (HARMONIE) → richtings-shear behouden.
+  if (knmi) {
+    state.modelWindSpeed = knmi.speed;
+    state.modelWindDir = knmi.dir;
+    state.windSpeed10 = knmi.speed;
+    state.windDir10 = knmi.dir;
+    const upperTag = state.modelWindSpeed100 != null
+      ? ` + ${usedSource} (100m, ${d} ${hh}:${mm}Z)`
+      : '';
+    state.modelWindSource = `${knmi.source}${upperTag}`;
+    state.windSource = state.modelWindSource;
+  }
 }
 
 // ---------- Physics helpers ----------
-// Wind speed at altitude h (m AGL) via 1/7 power law. Direction assumed constant.
+// Wind op hoogte h (m AGL). Bij voorkeur via u/v-interpolatie tussen het 10m
+// en het 100m model-niveau — dat behoudt de RICHTINGS-DRAAIING met hoogte
+// (Ekman-spiraal in de grenslaag). De oude 1/7 power-law hield de richting
+// constant en gaf op zomerse ochtenden tientallen meters offset in de
+// voorspelling.
+//
+// Boven 100m extrapoleren we logaritmisch (zelfde u/v slope als 10→100m);
+// onder 10m schalen we lineair terug om singulariteit te vermijden.
+// Als er geen 100m data is, valt de functie terug op de oude power-law.
 function windAt(altAGL) {
   const h = Math.max(altAGL, 2);
+
+  if (state.windSpeed100 != null && state.windDir100 != null) {
+    const d10 = state.windDir10 * Math.PI / 180;
+    const d100 = state.windDir100 * Math.PI / 180;
+    const u10 = state.windSpeed10 * Math.sin(d10);
+    const v10 = state.windSpeed10 * Math.cos(d10);
+    const u100 = state.windSpeed100 * Math.sin(d100);
+    const v100 = state.windSpeed100 * Math.cos(d100);
+    // f = 0 op h=10m, f = 1 op h=100m; lineaire extrapolatie via log-hoogte
+    // werkt voor het hele bereik 2m..~1000m AGL prima.
+    const f = Math.log(h / 10) / Math.log(100 / 10);
+    const u = u10 + (u100 - u10) * f;
+    const v = v10 + (v100 - v10) * f;
+    return {
+      speed: Math.sqrt(u * u + v * v),
+      dir: (Math.atan2(u, v) * 180 / Math.PI + 360) % 360,
+    };
+  }
+
+  // Fallback: 1/7 power-law met constante richting (bv. wanneer handmatige
+  // override is gezet of de 100m API niet beschikbaar was).
   const scale = Math.pow(h / 10, WIND_SHEAR_ALPHA);
   return { speed: state.windSpeed10 * scale, dir: state.windDir10 };
 }
