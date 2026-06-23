@@ -262,6 +262,12 @@ const state = {
   windDir10: null,
   windSpeed100: null,        // upper-level wind voor richtings-draaiing met hoogte
   windDir100: null,
+  // IGC-circling wind: door de glider zelf gemeten op release-hoogte via
+  // mean-of-circle-drift. Dit is de meest accurate bron — directe meting bovenin.
+  windSpeedRelease: null,
+  windDirRelease: null,
+  releaseAltAGL: null,       // hoogte waarop deze meting geldt (m AGL)
+  igcWindNote: '',           // korte uitleg-tekst voor de UI
   windSource: '',
   modelWindSpeed: null,  // keeps model value so "reset" restores it
   modelWindDir: null,
@@ -346,8 +352,29 @@ async function handleFile(file) {
       return;
     }
     detectRelease();
+    // Extraheer wind op release-hoogte uit de IGC zelf (mean-of-circle-drift).
+    // Dit overschrijft de model-extrapolatie naar release-hoogte met een
+    // gemeten waarde — fundamenteel betrouwbaarder.
+    const igcWind = extractWindFromIGC();
+    if (igcWind) {
+      state.windSpeedRelease = igcWind.speed;
+      state.windDirRelease = igcWind.dir;
+      state.releaseAltAGL = igcWind.altAGL;
+      state.igcWindNote = `IGC-circling: ${igcWind.speed.toFixed(1)} m/s uit ${Math.round(igcWind.dir)}° op ${igcWind.altAGL}m AGL (${igcWind.rotation}° rotatie, ${igcWind.durationS}s)`;
+    } else {
+      state.windSpeedRelease = null;
+      state.windDirRelease = null;
+      state.releaseAltAGL = null;
+      state.igcWindNote = '';
+    }
     showStatus('Winddata ophalen (KNMI HARMONIE via Open-Meteo)...', 'info');
     await fetchWind();
+    // Voeg de IGC-circling meting toe aan de wind-bron-label (zichtbaar in UI)
+    // én bewaar 'm in modelWindSource zodat reset 'm óók herstelt.
+    if (state.igcWindNote) {
+      state.windSource = `${state.windSource} + ${state.igcWindNote}`;
+      state.modelWindSource = state.windSource;
+    }
     showStatus('Berekening gereed.', 'success');
     resultsEl.classList.remove('hidden');
     const releaseFix = state.fixes[state.releaseIdx];
@@ -398,6 +425,77 @@ function parseIGC(text) {
   if (!state.date && state.fixes.length) {
     state.date = new Date().toISOString().slice(0,10);
   }
+}
+
+// Extract wind aloft uit het IGC-bestand via mean-of-circle-drift: in cirkels
+// middelt de eigen luchtsnelheid (TAS) uit, dus mean(groundspeed-vector) over
+// een volle 360° = wind-velocity-vector. Dit is een DIRECTE meting van de wind
+// op release-hoogte uit de eigen vlucht — veruit de meest accurate bron.
+function extractWindFromIGC() {
+  if (state.releaseIdx == null || state.fixes.length < 30) return null;
+  const fixes = state.fixes;
+  const start = state.releaseIdx;
+  if (start >= fixes.length - 20) return null;
+
+  const tStart = fixes[start].t;
+  // Window: tot 180s na release scannen
+  let endIdx = start;
+  while (endIdx < fixes.length - 1 && fixes[endIdx].t - tStart < 180) endIdx++;
+  if (endIdx - start < 20) return null;
+
+  // Per fix-interval: dx/dy (m), dt, heading, midden-altitude
+  const segs = [];
+  for (let i = start; i < endIdx; i++) {
+    const a = fixes[i], b = fixes[i + 1];
+    const dt = b.t - a.t;
+    if (dt <= 0 || dt > 10) continue;
+    const latMid = (a.lat + b.lat) / 2 * Math.PI / 180;
+    const dy = (b.lat - a.lat) * 111320;
+    const dx = (b.lon - a.lon) * 111320 * Math.cos(latMid);
+    segs.push({
+      dt, dx, dy,
+      hdg: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360,
+      alt: (a.alt + b.alt) / 2,
+    });
+  }
+  if (segs.length < 20) return null;
+
+  // Som ondertekende heading-veranderingen (met wrap) → totaal aantal graden
+  // rotatie. Min. 350° vereist (één volle cirkel) voor betrouwbare wind-meting.
+  let totalRotation = 0;
+  for (let i = 1; i < segs.length; i++) {
+    let dh = segs[i].hdg - segs[i - 1].hdg;
+    if (dh > 180) dh -= 360;
+    if (dh < -180) dh += 360;
+    totalRotation += dh;
+  }
+  if (Math.abs(totalRotation) < 350) return null;
+
+  // Mean groundspeed-vector (gewogen op dt) = wind TO-vector.
+  let sumDx = 0, sumDy = 0, sumDt = 0, sumAlt = 0;
+  for (const s of segs) {
+    sumDx += s.dx;
+    sumDy += s.dy;
+    sumDt += s.dt;
+    sumAlt += s.alt * s.dt;
+  }
+  if (sumDt === 0) return null;
+  const meanU_to = sumDx / sumDt;
+  const meanV_to = sumDy / sumDt;
+  const speed = Math.sqrt(meanU_to * meanU_to + meanV_to * meanV_to);
+  // FROM-richting = TO + 180° (meteo conventie)
+  const toDir = (Math.atan2(meanU_to, meanV_to) * 180 / Math.PI + 360) % 360;
+  const fromDir = (toDir + 180) % 360;
+  const meanAlt = sumAlt / sumDt;
+  const altAGL = Math.round(meanAlt - state.groundAlt);
+
+  return {
+    speed,
+    dir: fromDir,
+    altAGL,
+    rotation: Math.round(Math.abs(totalRotation)),
+    durationS: Math.round(sumDt),
+  };
 }
 
 function detectRelease() {
@@ -658,6 +756,44 @@ async function fetchWind() {
 function windAt(altAGL) {
   const h = Math.max(altAGL, 2);
 
+  // PRIORITEIT 1: IGC-circling wind als bovenste anker.
+  // De glider heeft de wind op release-hoogte zelf gemeten via cirkel-drift.
+  // Dat is een directe meting van die specifieke vlucht — beter dan welk
+  // model-grid ook. Boven release-hoogte houden we de wind constant (geen
+  // extrapolatie buiten meetbereik). Onder release-hoogte log-interpoleren
+  // tussen het 10m-wind en deze IGC-meting.
+  if (state.windSpeedRelease != null && state.releaseAltAGL != null
+      && state.windSpeed10 != null && state.releaseAltAGL > 15) {
+    const hRel = state.releaseAltAGL;
+    let u, v;
+    if (h >= hRel) {
+      const dR = state.windDirRelease * Math.PI / 180;
+      u = state.windSpeedRelease * Math.sin(dR);
+      v = state.windSpeedRelease * Math.cos(dR);
+    } else if (h <= 10) {
+      const d10 = state.windDir10 * Math.PI / 180;
+      u = state.windSpeed10 * Math.sin(d10);
+      v = state.windSpeed10 * Math.cos(d10);
+    } else {
+      const d10 = state.windDir10 * Math.PI / 180;
+      const dR = state.windDirRelease * Math.PI / 180;
+      const u10 = state.windSpeed10 * Math.sin(d10);
+      const v10 = state.windSpeed10 * Math.cos(d10);
+      const uR = state.windSpeedRelease * Math.sin(dR);
+      const vR = state.windSpeedRelease * Math.cos(dR);
+      const f = Math.log(h / 10) / Math.log(hRel / 10);
+      u = u10 + (uR - u10) * f;
+      v = v10 + (vR - v10) * f;
+    }
+    return {
+      speed: Math.sqrt(u * u + v * v),
+      dir: (Math.atan2(u, v) * 180 / Math.PI + 360) % 360,
+    };
+  }
+
+  // PRIORITEIT 2: model 10m + 100m wind, MET clamp f∈[0,1] zodat we niet
+  // de discrepantie surface-meting vs model-100m verder extrapoleren naar
+  // 270m+ (dat creëerde voorheen een buggy gradiënt — zie analyse 2026-06-23).
   if (state.windSpeed100 != null && state.windDir100 != null) {
     const d10 = state.windDir10 * Math.PI / 180;
     const d100 = state.windDir100 * Math.PI / 180;
@@ -665,9 +801,8 @@ function windAt(altAGL) {
     const v10 = state.windSpeed10 * Math.cos(d10);
     const u100 = state.windSpeed100 * Math.sin(d100);
     const v100 = state.windSpeed100 * Math.cos(d100);
-    // f = 0 op h=10m, f = 1 op h=100m; lineaire extrapolatie via log-hoogte
-    // werkt voor het hele bereik 2m..~1000m AGL prima.
-    const f = Math.log(h / 10) / Math.log(100 / 10);
+    const fRaw = Math.log(h / 10) / Math.log(100 / 10);
+    const f = Math.max(0, Math.min(1, fRaw));
     const u = u10 + (u100 - u10) * f;
     const v = v10 + (v100 - v10) * f;
     return {
@@ -676,8 +811,7 @@ function windAt(altAGL) {
     };
   }
 
-  // Fallback: 1/7 power-law met constante richting (bv. wanneer handmatige
-  // override is gezet of de 100m API niet beschikbaar was).
+  // Fallback: 1/7 power-law met constante richting.
   const scale = Math.pow(h / 10, WIND_SHEAR_ALPHA);
   return { speed: state.windSpeed10 * scale, dir: state.windDir10 };
 }
